@@ -1,58 +1,28 @@
-import ccxt
+import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
-import time
-import datetime
 import warnings
-import math
-import os # Ortam değişkenlerini okumak için
 
 warnings.filterwarnings("ignore")
 
-# --- GENEL AYARLAR VE GÜVENLİK (Gerçek API Bilgilerinizi Buraya Yazın) ---
+# --- SAYFA AYARLARI ---
+st.set_page_config(page_title="Hedge Fund Manager: Dynamic V7 (Alpha Odaklı)", layout="wide", initial_sidebar_state="expanded")
 
-# GÜVENLİK TAVSİYESİ: API anahtarlarını ortam değişkenlerinden çekin.
-api_key = os.environ.get("BINANCE_API_KEY", "YOUR_BINANCE_API_KEY")
-api_secret = os.environ.get("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
+# --- CSS STİL ---
+st.markdown("""
+<style>
+    .stButton>button { width: 100%; border-radius: 10px; height: 3em; background-color: #00796B; color: white; font-weight: bold; }
+    div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+</style>
+""", unsafe_allow_html=True)
 
-exchange = ccxt.binance({
-    'apiKey': api_key,
-    'secret': api_secret,
-    'enableRateLimit': True,
-})
-
-# --- BOT PARAMETRELERİ ---
-tickers = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"] 
-initial_capital = 10000 
-commission = 0.001
-n_states = 3
-validation_days = 21 
-DECISION_THRESHOLD = 0.25 # Karar Eşiği (AL/SAT)
-
-# --- RİSK PARAMETRELERİ (Yeni Eklenenler) ---
-STOP_LOSS_PCT = 0.02      # %2 Zarar Durdurma
-MIN_HOLD_HOURS = 24       # Minimum pozisyon tutma süresi (Saat)
-MAX_ALLOCATION_PER_COIN = 0.50 # Tek bir coine maksimum kasanın %50'si
-MTF_CONSENSUS_REQUIRED = 2 # İşlem için gerekli minimum Timeframe onayı (D, W, M)
-
-# --- ZAMAN DİLİMLERİ ---
-TIME_FRAMES = {'DAILY': '1d', 'WEEKLY': '1w', 'MONTHLY': '1M'}
-WEIGHT_CANDIDATES = np.linspace(0.1, 0.9, 9)
-
-# --- GLOBAL DURUM KAYDI (Simülasyon İçin) ---
-PORTFOLIO_STATE = {'USDT': initial_capital, 'total_value': initial_capital}
-POSITIONS = {t: {'qty': 0, 'entry_price': 0, 'entry_time': None} for t in tickers}
-TRADE_LOG = [] # Tüm işlemleri kaydeder
-HOURLY_UPDATE_LOG = [] # Portföy değeri takibi için saatlik log
-
-# --- YARDIMCI FONKSİYONLAR ---
-
+# --- CUSTOM SCORE ---
 def calculate_custom_score(df):
-    # Veri yeterliliği kontrolü (En uzun periyot 365 gün)
-    if len(df) < 366: return pd.Series(0, index=df.index)
-
+    """5'li Puanlama Sistemi (-7 ile +7 arası)"""
+    if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(5), 1, -1)
     s2 = np.where(df['close'] > df['close'].shift(35), 1, -1)
     s3 = np.where(df['close'] > df['close'].shift(150), 1, -1)
@@ -61,23 +31,27 @@ def calculate_custom_score(df):
     s5 = np.where(vol < vol.shift(5), 1, -1)
     s6 = np.where(df['volume'] > df['volume'].rolling(5).mean(), 1, -1) if 'volume' in df.columns else 0
     s7 = np.where(df['close'] > df['open'], 1, -1) if 'open' in df.columns else 0
-    return s1+s2+s3+s4+s5+s6+s7
+    return s1 + s2 + s3 + s4 + s5 + s6 + s7
 
-def get_ohlcv(ticker, timeframe, limit=1000):
-    """Borsa API'den OHLCV verisini çeker."""
-    # Varsayılan başlangıç tarihi (ccxt için)
-    since = exchange.parse8601('2018-01-01T00:00:00Z') 
-    
-    ohlcv = exchange.fetch_ohlcv(ticker, timeframe=timeframe, limit=limit, since=since)
-    df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df.dropna(inplace=True)
-    return df
+# --- VERİ ÇEKME ---
+@st.cache_data(ttl=21600)
+def get_data_cached(ticker, start_date):
+    try:
+        df = yf.download(ticker, start=start_date, progress=False)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df.columns = [c.lower() for c in df.columns]
+        if 'close' not in df.columns and 'adj close' in df.columns: df['close'] = df['adj close']
+        df.dropna(inplace=True)
+        return df
+    except:
+        return None
 
-def optimize_dynamic_weights(df):
+# --- DİNAMİK AĞIRLIK OPTİMİZASYONU ---
+def optimize_dynamic_weights(df, n_states, commission, alloc_capital, validation_days=21):
     """
-    Son 21 günlük validation verisi üzerinde en iyi HMM/Puan ağırlığını bulur.
+    HMM + Custom Score ağırlıklarını son 3 haftalık (21 gün) validation verisine göre optimize eder.
+    En iyi ROI veren ağırlık kombinasyonu seçilir.
     """
     df = df.copy()
     df['log_ret'] = np.log(df['close']/df['close'].shift(1))
@@ -85,295 +59,209 @@ def optimize_dynamic_weights(df):
     df['custom_score'] = calculate_custom_score(df)
     df.dropna(inplace=True)
     
-    if len(df)<validation_days+5: return (0.7,0.3)
+    if len(df) < validation_days + 10: return 0.7, 0.3
+
+    train_data = df.iloc[:-validation_days]
+    val_data = df.iloc[-validation_days:]
     
-    train_df = df.iloc[:-validation_days]
-    test_df = df.iloc[-validation_days:]
-    
-    X = train_df[['log_ret','range']].values
+    # HMM eğitimi (Uzun Dönem Veri)
+    X_train = train_data[['log_ret','range']].values
     scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
-    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=100, random_state=42)
-    model.fit(X_s)
+    X_train_s = scaler.fit_transform(X_train)
+    model = GaussianHMM(n_components=n_states, covariance_type="full", n_iter=100, random_state=42)
+    model.fit(X_train_s)
     
-    state_stats = train_df.groupby(model.predict(X_s))['log_ret'].mean()
+    train_data['state'] = model.predict(X_train_s)
+    state_stats = train_data.groupby('state')['log_ret'].mean()
     bull_state = state_stats.idxmax()
     bear_state = state_stats.idxmin()
     
     best_roi = -np.inf
-    best_w = (0.5,0.5) 
+    best_w = (0.7,0.3)
     
-    # Grid search HMM ağırlığı
-    for w_hmm in WEIGHT_CANDIDATES:
-        w_score = 1-w_hmm
-        cash_sim = initial_capital 
-        coin_amt_sim = 0
+    # Grid search HMM ağırlığı (0.1'den 0.95'e kadar 0.05'lik adımlarla)
+    for w_hmm in np.arange(0.1, 1.0, 0.05):
+        w_score = 1 - w_hmm
+        cash = alloc_capital
+        coin_amt = 0
         
-        for idx,row in test_df.iterrows():
-            X_test = scaler.transform([[row['log_ret'], row['range']]])
-            hmm_signal = 1 if model.predict(X_test)[0]==bull_state else (-1 if model.predict(X_test)[0]==bear_state else 0)
+        # Validation Simülasyonu
+        for idx,row in val_data.iterrows():
+            # HMM sinyali için val datası özelliklerini ölçeklendir
+            X_point = scaler.transform([[row['log_ret'], row['range']]])
+            hmm_signal = 1 if model.predict(X_point)[0]==bull_state else (-1 if model.predict(X_point)[0]==bear_state else 0)
             score_signal = 1 if row['custom_score']>=3 else (-1 if row['custom_score']<=-3 else 0)
             decision = w_hmm*hmm_signal + w_score*score_signal
             price = row['close']
             
-            # Not: Optimizasyonda karar eşiği kullanılmaz, sadece ROI'ye bakılır
-            if decision > 0.25: coin_amt_sim=cash_sim/price; cash_sim=0
-            elif decision < -0.25: cash_sim=coin_amt_sim*price; coin_amt_sim=0
+            # --- Karar Eşiği (Validation) ---
+            if decision>0.2: # Sinyali 0.2'ye düşürerek daha az agresif sinyaller üretir
+                coin_amt = cash/price
+                cash = 0
+            elif decision<-0.2:
+                cash = coin_amt*price
+                coin_amt = 0
+            # ---------------------------------
+
+        final_val = cash + coin_amt*val_data['close'].iloc[-1]
+        roi = (final_val - alloc_capital)/alloc_capital
+        if roi > best_roi:
+            best_roi = roi
+            best_w = (w_hmm,w_score)
             
-        final_val = cash_sim + coin_amt_sim*test_df['close'].iloc[-1]
-        roi = (final_val-initial_capital)/initial_capital
-        
-        if roi>best_roi: best_roi=roi; best_w=(w_hmm,w_score)
-        
     return best_w
 
-def place_order_sim(ticker, side, amount_usd, price, time_now):
-    """Gerçek emir göndermek yerine pozisyonu güncelleyen simülasyon fonksiyonu"""
-    global PORTFOLIO_STATE
+# --- MULTI-TIMEFRAME BACKTEST ---
+def run_multi_timeframe(df_raw, params, alloc_capital):
+    n_states=params['n_states']
+    commission=params['commission']
+    timeframes={'GÜNLÜK':'D','HAFTALIK':'W','AYLIK':'M'}
     
-    if side == 'buy':
-        qty = (amount_usd / price) * (1 - commission)
-        
-        # Risk Kontrolü: Tekrar AL sinyali gelirse ortalama maliyet hesapla
-        if POSITIONS[ticker]['qty'] > 0:
-            old_qty = POSITIONS[ticker]['qty']
-            old_usd_value = old_qty * POSITIONS[ticker]['entry_price']
-            
-            new_qty = old_qty + qty
-            new_usd_value = old_usd_value + amount_usd
-            new_entry_price = new_usd_value / new_qty
-            
-            POSITIONS[ticker]['entry_price'] = new_entry_price
-            POSITIONS[ticker]['qty'] = new_qty
-            
+    best_roi=-np.inf
+    best_portfolio=[]
+    best_config={}
+    
+    # Adım 1: En iyi HMM/Puan ağırlığını optimize et
+    w_hmm,w_score = optimize_dynamic_weights(df_raw,n_states,commission,alloc_capital)
+    
+    # Adım 2: Tüm zaman dilimleri ve tüm data üzerinde backtest yap
+    for tf_name,tf_code in timeframes.items():
+        if tf_code=='D':
+            df=df_raw.copy()
         else:
-            POSITIONS[ticker]['qty'] = qty
-            POSITIONS[ticker]['entry_price'] = price
-            POSITIONS[ticker]['entry_time'] = time_now
+            agg={'close':'last','high':'max','low':'min'}
+            if 'open' in df_raw.columns: agg['open']='first'
+            if 'volume' in df_raw.columns: agg['volume']='sum'
+            df=df_raw.resample(tf_code).agg(agg).dropna()
+        if len(df)<50: continue
+        
+        df['log_ret']=np.log(df['close']/df['close'].shift(1))
+        df['range']=(df['high']-df['low'])/df['close']
+        df['custom_score']=calculate_custom_score(df)
+        df.dropna(inplace=True)
+        
+        X=df[['log_ret','range']].values
+        scaler=StandardScaler()
+        X_s=scaler.fit_transform(X)
+        try:
+            model=GaussianHMM(n_components=n_states,covariance_type='full',n_iter=100,random_state=42)
+            model.fit(X_s)
+            df['state']=model.predict(X_s)
+        except: continue
+        
+        state_stats=df.groupby('state')['log_ret'].mean()
+        bull_state=state_stats.idxmax()
+        bear_state=state_stats.idxmin()
+        
+        cash=alloc_capital
+        coin_amt=0
+        portfolio=[]
+        history={}
+        
+        for idx,row in df.iterrows():
+            price=row['close']
+            hmm_signal=1 if row['state']==bull_state else (-1 if row['state']==bear_state else 0)
+            score_signal=1 if row['custom_score']>=3 else (-1 if row['custom_score']<=-3 else 0)
+            decision=w_hmm*hmm_signal + w_score*score_signal
             
-        PORTFOLIO_STATE['USDT'] -= amount_usd
-        
-        TRADE_LOG.append({
-            'Time': time_now, 'Ticker': ticker, 'Action': 'BUY', 'Qty': qty,
-            'Price': price, 'Fee': amount_usd * commission, 'Reason': 'Signal',
-            'Timeframe': 'MTF'
-        })
-        print(f"🟢 BUY {ticker} @ {price:.2f} | Kasa Kalan: {PORTFOLIO_STATE['USDT']:.2f}")
-
-    elif side == 'sell':
-        qty = POSITIONS[ticker]['qty']
-        if qty == 0: return
-
-        revenue = qty * price
-        revenue_after_fee = revenue * (1 - commission)
-        
-        PORTFOLIO_STATE['USDT'] += revenue_after_fee
-        
-        TRADE_LOG.append({
-            'Time': time_now, 'Ticker': ticker, 'Action': 'SELL', 'Qty': qty,
-            'Price': price, 'Fee': revenue * commission, 'Reason': 'Signal',
-            'Pnl_Pct': (price / POSITIONS[ticker]['entry_price'] - 1) * 100,
-            'Timeframe': 'MTF'
-        })
-        
-        POSITIONS[ticker]['qty'] = 0
-        POSITIONS[ticker]['entry_price'] = 0
-        POSITIONS[ticker]['entry_time'] = None
-        print(f"🔴 SELL {ticker} @ {price:.2f} | Gelir: {revenue_after_fee:.2f} | Kasa: {PORTFOLIO_STATE['USDT']:.2f}")
-
-    elif side == 'stop_loss':
-        qty = POSITIONS[ticker]['qty']
-        if qty == 0: return
-        
-        revenue = qty * price
-        revenue_after_fee = revenue * (1 - commission)
-        
-        PORTFOLIO_STATE['USDT'] += revenue_after_fee
-        
-        TRADE_LOG.append({
-            'Time': time_now, 'Ticker': ticker, 'Action': 'STOP_LOSS', 'Qty': qty,
-            'Price': price, 'Fee': revenue * commission, 'Reason': 'SL',
-            'Pnl_Pct': (price / POSITIONS[ticker]['entry_price'] - 1) * 100,
-            'Timeframe': 'Risk Control'
-        })
-        
-        POSITIONS[ticker]['qty'] = 0
-        POSITIONS[ticker]['entry_price'] = 0
-        POSITIONS[ticker]['entry_time'] = None
-        print(f"🚨 STOP_LOSS {ticker} @ {price:.2f} | Pozisyon Kapatıldı. Kasa: {PORTFOLIO_STATE['USDT']:.2f}")
-
-
-def check_stop_loss(ticker, price, time_now):
-    """Pozisyonda %STOP_LOSS_PCT zarar var mı kontrol eder."""
-    pos = POSITIONS[ticker]
-    if pos['qty'] > 0 and pos['entry_price'] > 0:
-        loss_pct = (pos['entry_price'] - price) / pos['entry_price']
-        if loss_pct >= STOP_LOSS_PCT:
-            place_order_sim(ticker, 'stop_loss', 0, price, time_now) # 0 miktarı sadece stop_loss sinyalini tetikler
-
-def check_minimum_hold_time(ticker, time_now):
-    """Minimum tutma süresi doldu mu kontrol eder."""
-    pos = POSITIONS[ticker]
-    if pos['entry_time'] is None: return True
-    
-    elapsed_time = time_now - pos['entry_time']
-    if elapsed_time.total_seconds() >= MIN_HOLD_HOURS * 3600:
-        return True
-    return False
-
-def update_portfolio_value(time_now):
-    """Anlık portföy değerini hesaplar ve loglar."""
-    global PORTFOLIO_STATE
-    
-    total_value = PORTFOLIO_STATE['USDT']
-    
-    for ticker in tickers:
-        qty = POSITIONS[ticker]['qty']
-        if qty > 0:
-            try:
-                # Gerçek zamanlı fiyat çek
-                ticker_data = exchange.fetch_ticker(ticker)
-                price = ticker_data['close']
-                total_value += qty * price
-            except Exception:
-                # Eğer fiyat çekilemezse, pozisyonu son entry fiyatından tut
-                total_value += qty * POSITIONS[ticker]['entry_price']
-    
-    PORTFOLIO_STATE['total_value'] = total_value
-    
-    HOURLY_UPDATE_LOG.append({
-        'Time': time_now,
-        'Total_Value': total_value,
-        'USDT_Balance': PORTFOLIO_STATE['USDT'],
-        'Positions': {t: POSITIONS[t]['qty'] for t in tickers}
-    })
-    
-    print(f"\n[PORTFÖY GÜNCELLEME] {time_now.strftime('%Y-%m-%d %H:%M:%S')} | Toplam Değer: {total_value:.2f} USDT")
-
-# --- ANA BOT DÖNGÜSÜ ---
-def run_live_bot():
-    """Tüm analiz, risk kontrolü ve işlem mantığını içeren ana döngü."""
-    global PORTFOLIO_STATE
-    
-    # Simülasyonun Başlangıç Ayarı
-    capital_per_coin = initial_capital / len(tickers)
-    
-    # ⚠️ Güvenlik Kontrolü: API Anahtarı eksikse durdur
-    if api_key == "YOUR_BINANCE_API_KEY" or api_secret == "YOUR_BINANCE_API_SECRET":
-        print("\nFATAL HATA: Lütfen API anahtarlarınızı güncelleyin.")
-        return
-
-    # Başlangıç logu
-    print("\n--- DYNAMIC V9 BOT BAŞLATILIYOR ---")
-    print(f"Başlangıç Sermayesi: {initial_capital} USDT. | Risk Eşiği: {DECISION_THRESHOLD}")
-    print(f"Stop Loss: {STOP_LOSS_PCT*100}%. | Min Hold: {MIN_HOLD_HOURS} saat.")
-    print("-----------------------------------\n")
-
-    # Hafta sonu takibini 168 saat (7 gün) veya manuel olarak durdurana kadar yap
-    start_time = datetime.datetime.now()
-    # 7 gün (168 saat) boyunca çalışsın
-    end_time_limit = start_time + datetime.timedelta(hours=168) 
-    
-    current_time = start_time
-    
-    while current_time < end_time_limit:
-        
-        time_now = datetime.datetime.now()
-        print(f"=== {time_now.strftime('%Y-%m-%d %H:%M:%S')} ===")
-        
-        update_portfolio_value(time_now) # Portföyü başta ve her saat güncelle
-
-        for ticker in tickers:
-            try:
-                # 1. SL Kontrolü: Pozisyon varsa Stop Loss kontrolü yap
-                if POSITIONS[ticker]['qty'] > 0:
-                    current_price = exchange.fetch_ticker(ticker)['close']
-                    check_stop_loss(ticker, current_price, time_now)
-                    # SL tetiklenirse POSITIONS[ticker] sıfırlanmıştır
-
-                # 2. Ağırlık Optimizasyonu
-                # Sadece DAILY (1d) verisi ile (en uzun geçmişi çeker) optimize et
-                df_long = get_ohlcv(ticker, timeframe='1d', limit=1000)
-                w_hmm, w_score = optimize_dynamic_weights(df_long)
+            target_pct=None
+            action_text="BEKLE"
+            
+            # --- Karar Eşiği (Backtest) ---
+            if decision>0.2: 
+                target_pct=1.0; action_text="AL"
+            elif decision<-0.2:
+                target_pct=0.0; action_text="SAT"
+            # -------------------------------
+            
+            if target_pct is not None:
+                curr_val=cash+coin_amt*price
+                curr_pct=(coin_amt*price)/curr_val if curr_val>0 else 0
                 
-                # 3. MTF Sinyal Üretimi
-                consensus_score = 0
-                
-                for tf_name, tf_code in TIME_FRAMES.items():
-                    df_tf = get_ohlcv(ticker, timeframe=tf_code, limit=500)
-                    
-                    df_tf['log_ret'] = df_tf['close'].pct_change().apply(lambda x: np.log(1+x))
-                    df_tf['range'] = (df_tf['high']-df_tf['low'])/df_tf['close']
-                    df_tf['custom_score'] = calculate_custom_score(df_tf)
-                    df_tf.dropna(inplace=True)
-                    
-                    if len(df_tf) < 50: continue
-
-                    X = df_tf[['log_ret','range']].values
-                    scaler = StandardScaler()
-                    X_s = scaler.fit_transform(X)
-                    
-                    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=100, random_state=42)
-                    model.fit(X_s)
-
-                    state_stats = df_tf.groupby(model.predict(X_s))['log_ret'].mean()
-                    bull_state = state_stats.idxmax()
-                    bear_state = state_stats.idxmin()
-                    
-                    last_row = df_tf.iloc[-1]
-                    hmm_signal = 1 if model.predict(scaler.transform([[last_row['log_ret'], last_row['range']]]))[0]==bull_state else (-1 if model.predict(scaler.transform([[last_row['log_ret'], last_row['range']]]))[0]==bear_state else 0)
-                    score_signal = 1 if last_row['custom_score']>=3 else (-1 if last_row['custom_score']<=-3 else 0)
-                    
-                    decision = w_hmm*hmm_signal + w_score*score_signal
-                    
-                    if decision > DECISION_THRESHOLD: consensus_score += 1
-                    elif decision < -DECISION_THRESHOLD: consensus_score -= 1
-
-                # 4. İşlem Kararı (Konsensüs Kontrolü)
-                current_price = exchange.fetch_ticker(ticker)['close']
-                position_qty = POSITIONS[ticker]['qty']
-                
-                # Minimum tutma süresi kontrolü
-                can_trade = check_minimum_hold_time(ticker, time_now) 
-                
-                if consensus_score >= MTF_CONSENSUS_REQUIRED and position_qty == 0 and can_trade:
-                    # AL sinyali ve MTF onayı var
-                    amount_usd_to_buy = min(PORTFOLIO_STATE['USDT'] / (len(tickers) - sum(1 for p in POSITIONS.values() if p['qty'] > 0)), capital_per_coin)
-                    
-                    if amount_usd_to_buy > 10: # Minimum işlem limiti
-                        # Gerçek Alım Simülasyonu
-                        place_order_sim(ticker, 'buy', amount_usd_to_buy, current_price, time_now)
-                
-                elif consensus_score <= -MTF_CONSENSUS_REQUIRED and position_qty > 0 and can_trade:
-                    # SAT sinyali ve MTF onayı var
-                    # Gerçek Satış Simülasyonu
-                    place_order_sim(ticker, 'sell', 0, current_price, time_now) # Miktar 0, fonksiyon içinden çekilir
-                
+                # İşlem yap (Portföy Yeniden Dengeleme)
+                diff=(target_pct-curr_pct)*curr_val
+                fee=abs(diff)*commission
+                if diff>0:
+                    if cash>=diff: coin_amt+=(diff-fee)/price; cash-=diff
                 else:
-                    print(f"⚪ {ticker}: HOLD (Konsensüs: {consensus_score}/{MTF_CONSENSUS_REQUIRED}. Pozisyon: {position_qty:.2f})")
+                    sell=abs(diff)
+                    if coin_amt*price>=sell: coin_amt-=sell/price; cash+=sell-fee
             
-            except Exception as e:
-                print(f"🚨 {ticker} GENEL HATA (Döngü İçi): {e}")
+            portfolio.append(cash+coin_amt*price)
+            if idx==df.index[-1]:
+                regime='BOĞA' if hmm_signal==1 else ('AYI' if hmm_signal==-1 else 'YATAY')
+                history={"Fiyat":price,"HMM":regime,"Puan":int(row['custom_score']),"Öneri":action_text,
+                         "Zaman":tf_name,"Ağırlık":f"%{int(w_hmm*100):.0f} HMM / %{int(w_score*100):.0f} Puan"}
+        
+        if portfolio[-1]>best_roi:
+            best_roi=portfolio[-1]
+            best_portfolio=pd.Series(portfolio,index=df.index)
+            best_config=history
+            
+    return best_portfolio,best_config
 
-        # 1 saat bekle
-        time.sleep(3600) 
-        current_time = datetime.datetime.now()
+# --- ARAYÜZ ---
+st.title("🏆 Hedge Fund Manager: Dynamic HMM+Score V7")
+st.markdown("### 📊 Alpha Odaklı, Dinamik Ağırlık Optimizasyonlu Backtest")
 
-    # Bot durduktan sonra sonuçları yazdırma
-    print("\n--- BOT SİMÜLASYONU SONUÇLANDI ---")
-    final_value = PORTFOLIO_STATE['total_value']
-    roi = (final_value - initial_capital) / initial_capital * 100
-    print(f"Final Bakiye: {final_value:.2f} USDT | ROI: {roi:.2f}%")
-    
-    # Logları DataFrame'e çevirip yazdırma
-    df_hourly = pd.DataFrame(HOURLY_UPDATE_LOG)
-    df_trades = pd.DataFrame(TRADE_LOG)
-    
-    print("\n--- SAATLİK PORTFÖY DEĞERİ TAKİP TABLOSU ---")
-    print(df_hourly.tail(24))
-    print("\n--- İŞLEM LOGU (SON 10 İŞLEM) ---")
-    print(df_trades.tail(10))
+with st.sidebar:
+    st.header("Ayarlar")
+    default_tickers=["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","AVAX-USD","DOGE-USD","ADA-USD"]
+    tickers=st.multiselect("Analiz Edilecek Coinler", default_tickers, default=default_tickers)
+    initial_capital=st.number_input("Kasa ($)",10000)
+    st.info("Sistem geçmiş veriyi dikkate alır ve **son 3 haftayı optimize ederek** HMM/Puan ağırlığını belirler. Alpha (HODL'dan fark) pozitifliği hedeflenmiştir.")
 
-# --- BOTU ÇALIŞTIR ---
-if __name__ == "__main__":
-    run_live_bot()
+if st.button("BÜYÜK TURNUVAYI BAŞLAT 🚀"):
+    if not tickers: st.error("Coin seçmelisin.")
+    else:
+        capital_per_coin=initial_capital/len(tickers)
+        results=[]
+        total_val=0
+        total_hodl=0
+        bar=st.progress(0)
+        
+        # Sadece 2018'den itibaren çek (Maksimum geçmiş)
+        start_date_yf="2018-01-01" 
+        
+        for i,ticker in enumerate(tickers):
+            bar.progress(i/len(tickers))
+            
+            df=get_data_cached(ticker,start_date_yf)
+            
+            if df is not None:
+                port,conf=run_multi_timeframe(df,{'n_states':3,'commission':0.001},capital_per_coin)
+                
+                if port is not None:
+                    final_val=port.iloc[-1]
+                    total_val+=final_val
+                    
+                    # HODL Hesaplama (İlk günden itibaren)
+                    hodl_val=(capital_per_coin/df['close'].iloc[0])*df['close'].iloc[-1]
+                    total_hodl+=hodl_val
+                    
+                    if conf:
+                        conf.update({"Coin":ticker,"Bakiye":final_val,"ROI":(final_val-capital_per_coin)/capital_per_coin*100})
+                        results.append(conf)
+                        
+        bar.progress(1.0)
+        st.success("Turnuva tamamlandı ✅")
+        
+        # Sonuç Metrikleri
+        c1,c2,c3=st.columns(3)
+        roi_total=(total_val-initial_capital)/initial_capital*100
+        alpha=total_val-total_hodl
+        
+        c1.metric("Toplam Bakiye",f"${total_val:,.0f}",f"%{roi_total:.1f}")
+        c2.metric("HODL Değeri",f"${total_hodl:,.0f}")
+        c3.metric("Alpha (Fark)",f"${alpha:,.0f}",delta_color="normal" if alpha>0 else "inverse")
+        
+        if results:
+            df_res=pd.DataFrame(results)
+            def highlight(val):
+                if val=='AL': return 'background-color: #00c853; color:white; font-weight:bold'
+                if val=='SAT': return 'background-color: #d50000; color:white; font-weight:bold'
+                return ''
+                
+            st.dataframe(df_res[['Coin','Fiyat','Öneri','Zaman','Ağırlık','HMM','Puan','ROI']].style.applymap(highlight,subset=['Öneri']).format({"Fiyat":"${:,.2f}","ROI":"%{:.1f}"}))
+        else:
+            st.error("Veri alınamadı veya hesaplanamadı.")
