@@ -40,6 +40,7 @@ with st.sidebar:
 
 # =============================================================================
 # 2. GOOGLE SHEETS
+# (DEĞİŞMEDİ)
 # =============================================================================
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -114,7 +115,8 @@ def calculate_heuristic_score(df):
 
 def get_raw_data(ticker):
     try:
-        df = yf.download(ticker, period="2y", interval="1d", progress=False)
+        # Yeni özellikler için 3 yıl veri çekildi
+        df = yf.download(ticker, period="3y", interval="1d", progress=False) 
         if df.empty: return None
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
@@ -129,21 +131,57 @@ def process_data(df, timeframe):
     elif timeframe == 'M': df_res = df.resample('ME').agg(agg).dropna()
     else: df_res = df.copy()
     if len(df_res) < 100: return None
+
+    # YENİ İSTATİSTİKSEL MODELLER/ÖZELLİKLER EKLENİYOR
+    
+    df_res['ret'] = df_res['close'].pct_change()
+    
+    # 1. Tarihsel Ortalama Değişimler (5 ay ve 3 yıl)
+    # Yaklaşık 5 ay = 100 işlem günü (20*5)
+    df_res['avg_ret_5m'] = df_res['ret'].rolling(window=100).mean() * 100 
+    # Yaklaşık 3 yıl = 750 işlem günü (250*3)
+    df_res['avg_ret_3y'] = df_res['ret'].rolling(window=750).mean() * 100 
+
+    # 2. Haftanın Günü Etkisi Puanı
+    df_res['day_of_week'] = df_res.index.dayofweek # Pazartesi=0, Pazar=6
+    day_returns = df_res.groupby('day_of_week')['ret'].mean().fillna(0)
+    df_res['day_score'] = df_res['day_of_week'].map(day_returns).fillna(0)
+    
+    # Yeni ortalamaları birleştiren normalize puan
+    avg_feats = df_res[['avg_ret_5m', 'avg_ret_3y', 'day_score']].fillna(0)
+    if len(avg_feats) > 0:
+        scaler_avg = StandardScaler()
+        # Normalizasyon ve tek bir puanda birleştirme
+        df_res['historical_avg_score'] = scaler_avg.fit_transform(avg_feats).mean(axis=1)
+    else:
+        df_res['historical_avg_score'] = 0.0
+
+    # 3. Oynaklık Değişim Puanı (Range Volatility Delta)
+    df_res['range_vol_delta'] = df_res['range'].pct_change(5).fillna(0)
+
+    # Mevcut özellik hesaplamaları
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
     df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
     df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
+    
     df_res.dropna(inplace=True)
     return df_res
 
 def ga_optimize(df, n_gen=5):
     best_depth = 5; best_nest = 50; best_score = -999
+    # GA için yeni özellik setini kullan
+    features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
+    
     for d in [3, 5, 7, 9]:
         for n in [20, 50, 100]:
             train = df.iloc[:-30]; test = df.iloc[-30:]
-            rf = RandomForestClassifier(n_estimators=n, max_depth=d).fit(train[['log_ret']], train['target'])
-            score = rf.score(test[['log_ret']], test['target'])
+            # Sadece mevcut olan özellikleri kullan
+            current_features = [f for f in features if f in train.columns] 
+            
+            rf = RandomForestClassifier(n_estimators=n, max_depth=d).fit(train[current_features], train['target'])
+            score = rf.score(test[current_features], test['target'])
             if score > best_score:
                 best_score = score; best_depth = d; best_nest = n
     return {'rf_depth': best_depth, 'rf_nest': best_nest, 'xgb_params': {'max_depth':3, 'n_estimators':50}}
@@ -154,39 +192,80 @@ def train_meta_learner(df, params=None):
     test_size = 60
     if len(df) < test_size + 50: return 0.0, None
     train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
-    X_tr = train[['log_ret', 'range', 'heuristic']]; y_tr = train['target']
+    
+    # Tüm base modeller için yeni özellikler
+    base_features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
+    X_tr = train[base_features]; y_tr = train['target']
+    X_test = test[base_features]
+
+    # RF ve XGBoost eğitimi (Tüm yeni özelliklerle)
     rf = RandomForestClassifier(n_estimators=rf_n, max_depth=rf_d, random_state=42).fit(X_tr, y_tr)
     xgb_c = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3).fit(X_tr, y_tr)
+    
+    # HMM eğitimi (log_ret ve range_vol_delta ile)
     scaler = StandardScaler()
-    X_hmm = scaler.fit_transform(train[['log_ret', 'range']])
+    X_hmm = scaler.fit_transform(train[['log_ret', 'range_vol_delta']]) # HMM için yeni özellik setini kullan
     hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50, random_state=42)
     try: hmm.fit(X_hmm)
     except: hmm = None
+    
+    # HMM Tahminleri
     hmm_pred = np.zeros(len(train))
     if hmm:
         pr = hmm.predict_proba(X_hmm)
         bull = np.argmax(hmm.means_[:,0]); bear = np.argmin(hmm.means_[:,0])
         hmm_pred = pr[:, bull] - pr[:, bear]
-    meta_X = pd.DataFrame({'RF': rf.predict_proba(X_tr)[:,1],'XGB': xgb_c.predict_proba(X_tr)[:,1],'HMM': hmm_pred,'Heuristic': train['heuristic'].values})
+        
+    # Meta Öğreniciye Girdiler (Lojistik Regresyon) - Tüm modellerin ve yeni faktörlerin çıktıları
+    meta_X = pd.DataFrame({
+        'RF': rf.predict_proba(X_tr)[:,1],
+        'XGB': xgb_c.predict_proba(X_tr)[:,1],
+        'HMM': hmm_pred,
+        'Heuristic': train['heuristic'].values,
+        'Historical_Avg_Score': train['historical_avg_score'].values # Yeni faktör
+    })
+    
     meta_model = LogisticRegression().fit(meta_X, y_tr)
     weights = meta_model.coef_[0]
+    
+    # Simülasyon
     sim_eq=[100]; hodl_eq=[100]; cash=100; coin=0; p0=test['close'].iloc[0]
-    X_hmm_t = scaler.transform(test[['log_ret','range']])
+    
+    # Test verisi için HMM tahminleri
+    X_hmm_t = scaler.transform(test[['log_ret','range_vol_delta']])
     hmm_p_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
     hmm_s_t = hmm_p_t[:, np.argmax(hmm.means_[:,0])] - hmm_p_t[:, np.argmin(hmm.means_[:,0])] if hmm else np.zeros(len(test))
-    mx_test = pd.DataFrame({'RF': rf.predict_proba(test[['log_ret','range','heuristic']])[:,1],'XGB': xgb_c.predict_proba(test[['log_ret','range','heuristic']])[:,1],'HMM': hmm_s_t,'Heuristic': test['heuristic'].values})
+    
+    # Test verisi için Meta Öğrenici Girdileri
+    mx_test = pd.DataFrame({
+        'RF': rf.predict_proba(X_test)[:,1],
+        'XGB': xgb_c.predict_proba(X_test)[:,1],
+        'HMM': hmm_s_t,
+        'Heuristic': test['heuristic'].values,
+        'Historical_Avg_Score': test['historical_avg_score'].values
+    })
+    
     probs = meta_model.predict_proba(mx_test)[:,1]
+    
+    # Ticaret Simülasyonu (Değişmedi)
     for i in range(len(test)):
         p = test['close'].iloc[i]; s=(probs[i]-0.5)*2
         if s>0.25 and cash>0: coin=cash/p; cash=0
         elif s<-0.25 and coin>0: cash=coin*p; coin=0
         sim_eq.append(cash+coin*p); hodl_eq.append((100/p0)*p)
+        
     final_signal=(probs[-1]-0.5)*2
-    info={'weights': weights,'bot_eq': sim_eq[1:],'hodl_eq': hodl_eq[1:],'dates': test.index,'alpha': (sim_eq[-1]-hodl_eq[-1]),'bot_roi': (sim_eq[-1]-100),'hodl_roi': (hodl_eq[-1]-100),'conf': probs[-1],'my_score': test['heuristic'].iloc[-1]}
+    
+    # GÜNCELLENMİŞ Model Etki İsimleri (Streamlit için)
+    weights_names = ['RandomForest','XGBoost','HMM','Senin Kuralın (Heuristic)','Tarihsel Ortalamalar']
+    
+    info={'weights': weights, 'weights_names': weights_names, 'bot_eq': sim_eq[1:],'hodl_eq': hodl_eq[1:],'dates': test.index,'alpha': (sim_eq[-1]-hodl_eq[-1]),'bot_roi': (sim_eq[-1]-100),'hodl_roi': (hodl_eq[-1]-100),'conf': probs[-1],'my_score': test['heuristic'].iloc[-1]}
+    
     return final_signal, info
 
 # =============================================================================
 # 4. TURNUVA FONKSİYONU
+# (DEĞİŞMEDİ)
 # =============================================================================
 def analyze_ticker_tournament(ticker, status_placeholder):
     raw_df = get_raw_data(ticker)
@@ -212,6 +291,7 @@ def analyze_ticker_tournament(ticker, status_placeholder):
 
 # =============================================================================
 # 5. ARAYÜZ
+# (Model Etki Dağılımı Güncellendi)
 # =============================================================================
 if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
     st.session_state['use_ga'] = use_ga
@@ -230,18 +310,26 @@ if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
                 dec, prc, tf, info = analyze_ticker_tournament(ticker, ph)
                 if dec!="HATA" and info:
                     sim_summary.append({"Coin":ticker,"Kazanan TF":tf,"Bot ROI":info['bot_roi'],"HODL ROI":info['hodl_roi'],"Alpha":info['alpha']})
-                    w=info['weights']; w_abs=np.abs(w); w_norm=w_abs/(np.sum(w_abs)+1e-9)*100
+                    
+                    # Model Etki Dağılımının Streamlit'te Gösterilmesi
+                    w=info['weights']; w_names=info['weights_names']
+                    w_abs=np.abs(w); w_norm=w_abs/(np.sum(w_abs)+1e-9)*100
+                    
+                    # Etkileri büyükten küçüğe sıralama
+                    w_df=pd.DataFrame({'Faktör':w_names,'Etki (%)':w_norm})
+                    w_df=w_df.sort_values(by='Etki (%)', ascending=False)
+                    
                     c1,c2=st.columns([1,2])
                     with c1:
                         st.markdown(f"### Karar: **{dec}**"); st.caption(f"Seçilen Zaman Dilimi: {tf}"); st.markdown(f"**Senin Puanın:** {info['my_score']:.2f}"); st.markdown("**Model Etki Dağılımı:**")
-                        w_df=pd.DataFrame({'Faktör':['RandomForest','XGBoost','HMM','Senin Kuralın'],'Etki (%)':w_norm})
-                        st.dataframe(w_df, hide_index=True)
+                        st.dataframe(w_df, hide_index=True) # SIRALI DATAFRAME
                     with c2:
                         fig=go.Figure(); fig.add_trace(go.Scatter(x=info['dates'],y=info['bot_eq'],name="Bot",line=dict(color='green',width=2)))
                         fig.add_trace(go.Scatter(x=info['dates'],y=info['hodl_eq'],name="HODL",line=dict(color='gray',dash='dot')))
                         color_ti="green" if info['alpha']>0 else "red"
                         fig.update_layout(title=f"Kazanan Strateji ({tf}) Alpha: ${info['alpha']:.2f}",title_font_color=color_ti,height=250,template="plotly_dark",margin=dict(t=30,b=0,l=0,r=0))
                         st.plotly_chart(fig, use_container_width=True)
+                    
                     stt=row['Durum']
                     if stt=='COIN' and dec=='SAT':
                         amt=float(row['Miktar'])
