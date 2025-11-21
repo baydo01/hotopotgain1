@@ -1,4 +1,3 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -8,6 +7,7 @@ import threading
 import warnings
 import gspread
 import json
+import os
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import pytz
@@ -24,10 +24,10 @@ from deap import base, creator, tools, algorithms
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Hedge Fund Manager: Kalman AI", layout="wide")
-st.title("🏦 Hedge Fund Manager: Portföy Yönetimi (Sheets Entegre)")
+st.title("🏦 Hedge Fund Manager: Portföy Yönetimi (Oto-Kurulum)")
 
 # =============================================================================
-# 1. AYARLAR (SENİN ESKİ KODUN VE YENİ PARAMETRELER)
+# 1. AYARLAR
 # =============================================================================
 
 SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE" 
@@ -39,30 +39,28 @@ with st.sidebar:
     use_ga = st.checkbox("Genetic Algoritma Kullan (Yavaşlatır)", False)
     ga_gens = st.number_input("GA Jenerasyon", 1, 50, 5)
     
-    st.info("Bot, Google Sheets'teki portföy tablosunu okur, Kalman AI ile karar verir ve bakiyeleri günceller.")
+    st.success("✅ OTO-KURULUM AKTİF: Bot, Sheets başlıklarını eksikse kendisi tamamlar.")
 
 # =============================================================================
-# 2. GOOGLE SHEETS BAĞLANTISI (ESKİ KODUN YAPISI KORUNDU)
+# 2. GOOGLE SHEETS BAĞLANTISI VE OTO-KURULUM
 # =============================================================================
 
 def connect_sheet():
-    """Google Sheets bağlantısını kurar (Secrets veya Local File)."""
+    """Google Sheets bağlantısını kurar."""
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
     creds = None
-    # Önce Streamlit Secrets kontrol et
     if "gcp_service_account" in st.secrets:
         try:
             creds_dict = dict(st.secrets["gcp_service_account"])
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         except: pass
     
-    # Yoksa yerel dosyaya bak
     if not creds and os.path.exists(CREDENTIALS_FILE):
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         
     if not creds:
-        st.error("Kimlik bilgileri (Secrets veya JSON) bulunamadı!")
+        st.error("Kimlik bilgileri bulunamadı!")
         return None
 
     try:
@@ -73,27 +71,45 @@ def connect_sheet():
         return None
 
 def load_portfolio():
-    """Mevcut portföy durumunu çeker."""
+    """
+    Portföyü çeker. EĞER SHEET BOŞSA VEYA HATALIYSA DÜZELTİR.
+    """
     sheet = connect_sheet()
     if sheet is None: return pd.DataFrame(), None
 
+    # --- OTO-KURULUM (AUTO-FIX) BAŞLANGICI ---
+    try:
+        headers = sheet.row_values(1) # İlk satırı oku
+        required_cols = ["Ticker", "Durum", "Miktar", "Son_Islem_Fiyati", 
+                         "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", 
+                         "Son_Islem_Log", "Son_Islem_Zamani"]
+        
+        # Eğer sayfa boşsa veya ilk hücre "Ticker" değilse -> TABLOYU YENİDEN KUR
+        if not headers or headers[0] != "Ticker":
+            print("⚠️ Sheet formatı bozuk veya boş. Otomatik düzeltiliyor...")
+            sheet.clear() # Temizle
+            sheet.append_row(required_cols) # Başlıkları yaz
+            
+            # Başlangıç verisi ekle (Senin istediğin 10$ ayarı)
+            # Örnek: BTC-USD, CASH modunda, 10$ bakiye ile başla
+            sheet.append_row(["BTC-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"])
+            print("✅ Tablo başlıkları ve örnek veri oluşturuldu.")
+            time.sleep(1) # Yazma işleminin bitmesini bekle
+            
+    except Exception as e:
+        print(f"Oto-Kurulum Hatası: {e}")
+    # --- OTO-KURULUM BİTİŞİ ---
+
+    # Şimdi veriyi çek
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
     
-    required_cols = ["Ticker", "Durum", "Miktar", "Son_Islem_Fiyati", 
-                     "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", 
-                     "Son_Islem_Log", "Son_Islem_Zamani"]
-    
     if df.empty: return pd.DataFrame(columns=required_cols), sheet
 
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = 0.0 if "USD" in col or "Miktar" in col or "Fiyat" in col else "-"
-
+    # Sayısal Dönüşümler
     numeric_cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for col in numeric_cols:
         if col in df.columns:
-            # Virgül/Nokta dönüşümü
             df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
             
@@ -107,7 +123,6 @@ def save_portfolio(df, sheet):
         df_export = df_export.astype(str)
         sheet.clear()
         sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
-        # Streamlit loguna yazma, print kullan (terminalde görünür)
         print(f"[{datetime.now().strftime('%H:%M')}] Portföy Sheets'e kaydedildi.")
     except Exception as e:
         print(f"Kaydetme Hatası: {e}")
@@ -117,16 +132,12 @@ def save_portfolio(df, sheet):
 # =============================================================================
 
 def apply_kalman_filter(prices):
-    n_iter = len(prices)
-    sz = (n_iter,)
+    n_iter = len(prices); sz = (n_iter,)
     Q = 1e-5; R = 0.01 ** 2
-    xhat = np.zeros(sz); P = np.zeros(sz)
-    xhatminus = np.zeros(sz); Pminus = np.zeros(sz); K = np.zeros(sz)
+    xhat = np.zeros(sz); P = np.zeros(sz); xhatminus = np.zeros(sz); Pminus = np.zeros(sz); K = np.zeros(sz)
     xhat[0] = prices.iloc[0]; P[0] = 1.0
-    
     for k in range(1, n_iter):
-        xhatminus[k] = xhat[k - 1]
-        Pminus[k] = P[k - 1] + Q
+        xhatminus[k] = xhat[k - 1]; Pminus[k] = P[k - 1] + Q
         K[k] = Pminus[k] / (Pminus[k] + R)
         xhat[k] = xhatminus[k] + K[k] * (prices.iloc[k] - xhatminus[k])
         P[k] = (1 - K[k]) * Pminus[k]
@@ -157,7 +168,6 @@ def process_data(df, timeframe):
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
     df_res['trend_signal'] = np.where(df_res['close'] > df_res['kalman_close'], 1, -1)
     
-    # Hareketli Ortalama Skoru
     df_res['ma5'] = df_res['close'].rolling(5).mean()
     long_w = {'D':252, 'W':52, 'M':36}.get(timeframe, 36)
     df_res['ma5_score'] = (df_res['ma5'] - df_res['ma5'].rolling(long_w).mean()) / (df_res['ma5'].rolling(long_w).std() + 1e-9)
@@ -170,7 +180,6 @@ def train_models_for_window(train_df, rf_depth=5, xgb_params=None, n_hmm=3):
     features = ['log_ret','range','trend_signal','ma5_score']
     X = train_df[features]; y = train_df['target']
     scaler = StandardScaler()
-    
     try: X_s = scaler.fit_transform(X)
     except: return None
 
@@ -223,7 +232,7 @@ def predict_with_models(models, row):
     
     return (hmm_sig * 0.25) + (stack_sig * 0.35) + (row['trend_signal'] * 0.4)
 
-# --- GA LIGHT (Hafif Versiyon) ---
+# --- GA LIGHT ---
 def ga_optimize(df, n_gen=5):
     if not hasattr(creator, 'FitnessMax'):
         creator.create('FitnessMax', base.Fitness, weights=(1.0,), overwrite=True)
@@ -236,11 +245,9 @@ def ga_optimize(df, n_gen=5):
     toolbox.register('population', tools.initRepeat, list, toolbox.individual)
     
     def eval_ind(ind):
-        # Basit backtest (Hız için son %20 veri)
         tst_size = int(len(df)*0.2)
         train = df.iloc[:-tst_size]; test = df.iloc[-tst_size:]
         if len(train)<20: return (-1,)
-        
         models = train_models_for_window(train, rf_depth=ind[0], xgb_params={'max_depth':ind[1], 'n_estimators':20})
         acc = 0
         for idx, row in test.iterrows():
@@ -253,12 +260,14 @@ def ga_optimize(df, n_gen=5):
     toolbox.register('select', tools.selTournament, tournsize=3)
     
     pop = toolbox.population(n=5)
-    algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=n_gen, verbose=False)
-    best = tools.selBest(pop, 1)[0]
-    return {'rf_depth': best[0], 'xgb_params': {'max_depth':best[1], 'n_estimators':30}}
+    try:
+        algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=n_gen, verbose=False)
+        best = tools.selBest(pop, 1)[0]
+        return {'rf_depth': best[0], 'xgb_params': {'max_depth':best[1], 'n_estimators':30}}
+    except: return None
 
 # =============================================================================
-# 4. KARAR MEKANİZMASI VE UYGULAMA
+# 4. KARAR MEKANİZMASI
 # =============================================================================
 
 def get_ai_decision(ticker):
@@ -267,7 +276,6 @@ def get_ai_decision(ticker):
     if raw_df is None: return "HATA", 0.0
     
     current_price = float(raw_df['close'].iloc[-1])
-    
     timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W'}
     best_score = -999; final_decision = "BEKLE"; winning_tf = "YOK"
     
@@ -279,13 +287,14 @@ def get_ai_decision(ticker):
         rf_depth = params['rf_depth'] if params else 5
         xgb_p = params['xgb_params'] if params else None
         
-        # Son 60 bar ile eğit, ŞİMDİKİ zamana (son satıra) karar ver
+        # Son 60 bar ile eğit, ŞİMDİKİ zamana karar ver
         models = train_models_for_window(df.iloc[-60:], rf_depth=rf_depth, xgb_params=xgb_p)
         signal = predict_with_models(models, df.iloc[-1])
         
         if abs(signal) > best_score:
             best_score = abs(signal)
             winning_tf = tf_name
+            # EŞİK DEĞERLERİ (0.25 = %25 Güven)
             if signal > 0.25: final_decision = "AL"
             elif signal < -0.25: final_decision = "SAT"
             else: final_decision = "BEKLE"
@@ -307,9 +316,9 @@ def background_bot_loop():
             tz = pytz.timezone('Europe/Istanbul')
             time_str = datetime.now(tz).strftime("%d-%m %H:%M")
             
-            pf_df, sheet = load_portfolio()
+            pf_df, sheet = load_portfolio() # BURADA OTO-KURULUM ÇALIŞACAK
             if pf_df.empty:
-                print("Portföy boş, bekleniyor...")
+                print("Portföy verisi alınamadı, bekleniyor...")
                 time.sleep(60); continue
                 
             updated = False
@@ -319,16 +328,15 @@ def background_bot_loop():
                 ticker = row['Ticker']
                 if not ticker or ticker == "-": continue
                 
-                # --- YENİ BEYNE SOR ---
+                print(f"\nAnaliz ediliyor: {ticker}")
                 decision, price = get_ai_decision(ticker)
                 
                 if price <= 0 or decision == "HATA": continue
                 
                 status = row['Durum']
                 
-                # --- İŞLEM MANTIĞI (SENİN ŞABLONUNA UYGUN) ---
+                # --- İŞLEM MANTIĞI ---
                 if status == 'COIN' and decision == 'SAT':
-                    # Satış: Coin Miktarını Nakite Çevir
                     amount = float(row['Miktar'])
                     if amount > 0:
                         cash_val = amount * price
@@ -341,9 +349,8 @@ def background_bot_loop():
                         updated = True
                         
                 elif status == 'CASH' and decision == 'AL':
-                    # Alış: Nakit Bakiyeyi Coine Çevir
                     cash_val = float(row['Nakit_Bakiye_USD'])
-                    if cash_val > 1.0: # Min 1$ işlem
+                    if cash_val > 1.0: 
                         amount = cash_val / price
                         pf_df.at[idx, 'Durum'] = 'COIN'
                         pf_df.at[idx, 'Miktar'] = amount
@@ -353,13 +360,12 @@ def background_bot_loop():
                         pf_df.at[idx, 'Son_Islem_Zamani'] = time_str
                         updated = True
                 
-                # Değer Güncelleme (Her döngüde güncel değer yazılsın)
+                # Değer Güncelleme
                 if pf_df.at[idx, 'Durum'] == 'COIN':
                     val = float(pf_df.at[idx, 'Miktar']) * price
                 else:
                     val = float(pf_df.at[idx, 'Nakit_Bakiye_USD'])
                 
-                # Sadece değer değişse bile kaydedelim ki canlı takip edilsin
                 if abs(float(row['Kaydedilen_Deger_USD']) - val) > 0.1:
                     pf_df.at[idx, 'Kaydedilen_Deger_USD'] = val
                     updated = True
@@ -395,7 +401,6 @@ with col2:
         stop_flag = True
         st.error("Durdurma sinyali gönderildi. Mevcut işlem bitince duracak.")
 
-# Canlı Durum Göstergesi
 st.divider()
 st.subheader("📋 Canlı Portföy Özeti")
 
@@ -403,7 +408,6 @@ try:
     df_view, _ = load_portfolio()
     if not df_view.empty:
         st.dataframe(df_view[["Ticker", "Durum", "Kaydedilen_Deger_USD", "Son_Islem_Log"]])
-        
         total_val = df_view["Kaydedilen_Deger_USD"].sum()
         st.metric("Toplam Portföy Değeri", f"${total_val:,.2f}")
 except:
