@@ -1,4 +1,4 @@
-!pip install streamlit yfinance hmmlearn scikit-learn pandas numpy gspread oauth2client
+pip install streamlit yfinance hmmlearn scikit-learn pandas numpy gspread oauth2client
 
 import streamlit as st
 import yfinance as yf
@@ -265,3 +265,4 @@ else:
         "Fiyat":"${:.2f}", "Değer ($)":"${:.2f}",
         "Kâr/Zarar ($)":"{:+.2f}", "Kâr/Zarar (%)":"{:+.2f}%"
     }))
+
