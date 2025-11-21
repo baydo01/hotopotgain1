@@ -9,6 +9,23 @@ import time
 import warnings
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import streamlit as st
+
+# Google Sheets yetki scope
+scope = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
+
+# Secrets’dan JSON key al
+json_key = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT_KEY"])
+creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key, scope)
+
+# Google Sheets'e bağlan
+client = gspread.authorize(creds)
+sheet_id = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
+sheet = client.open_by_key(sheet_id).sheet1
 
 warnings.filterwarnings("ignore")
 
@@ -264,5 +281,6 @@ else:
         "Fiyat":"${:.2f}", "Değer ($)":"${:.2f}",
         "Kâr/Zarar ($)":"{:+.2f}", "Kâr/Zarar (%)":"{:+.2f}%"
     }))
+
 
 
