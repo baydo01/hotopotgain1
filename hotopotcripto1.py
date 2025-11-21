@@ -11,7 +11,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import pytz
 
-# --- AI & ML KÜTÜPHANELERİ ---
+# --- AI & ML ---
 from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -22,8 +22,8 @@ from plotly.subplots import make_subplots
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund AI: Ultimate Dashboard", layout="wide")
-st.title("🏦 Hedge Fund AI: Şeffaf Yönetim & Simülasyon")
+st.set_page_config(page_title="Hedge Fund AI: Meta-Learner", layout="wide")
+st.title("🏦 Hedge Fund AI: Otonom Jüri & Ağırlıklandırma")
 
 # =============================================================================
 # 1. AYARLAR
@@ -33,20 +33,18 @@ SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
 CREDENTIALS_FILE = "service_account.json"
 
 with st.sidebar:
-    st.header("⚙️ Kontrol Paneli")
-    st.info("Bu panel, yapay zekanın 'Ağırlık Kararlarını' ve 'Validation Testi' sonuçlarını canlı gösterir.")
+    st.header("⚙️ Ayarlar")
+    st.info("Bu model, senin 5 adımlı kuralını ve AI modellerini Lojistik Regresyon ile yarıştırır ve ağırlıkları belirler.")
 
 # =============================================================================
-# 2. GOOGLE SHEETS & OTO-KURULUM
+# 2. GOOGLE SHEETS (GÜVENLİ & OTO-KURULUM)
 # =============================================================================
 
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = None
     if "gcp_service_account" in st.secrets:
-        try:
-            creds_dict = dict(st.secrets["gcp_service_account"])
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        try: creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
         except: pass
     elif os.path.exists(CREDENTIALS_FILE):
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
@@ -66,6 +64,8 @@ def load_and_fix_portfolio():
         required_cols = ["Ticker", "Durum", "Miktar", "Son_Islem_Fiyati", 
                          "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", 
                          "Son_Islem_Log", "Son_Islem_Zamani"]
+        
+        # Tablo boşsa veya başlık yoksa KURULUM YAP
         if not headers or headers[0] != "Ticker":
             sheet.clear(); sheet.append_row(required_cols)
             defaults = [
@@ -82,23 +82,25 @@ def load_and_fix_portfolio():
         
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
+    # Temizlik
     df = df[df['Ticker'].astype(str).str.contains('-USD', na=False)]
     
     numeric_cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+            df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
     return df, sheet
 
 def save_portfolio(df, sheet):
     if sheet is None: return
     try:
         df_export = df.copy(); df_export = df_export.astype(str)
-        sheet.clear(); sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
+        sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
     except: pass
 
 # =============================================================================
-# 3. AI ENGINE: KALMAN, HEURISTIC, AUTO-WEIGHTING
+# 3. GELİŞMİŞ BEYİN: HEURISTIC + AI + LOGISTIC REGRESSION
 # =============================================================================
 
 def apply_kalman_filter(prices):
@@ -112,16 +114,23 @@ def apply_kalman_filter(prices):
     return pd.Series(xhat, index=prices.index)
 
 def calculate_heuristic_score(df):
+    """Senin 5 Adımlı Puanlama Sistemin"""
     if len(df) < 150: return pd.Series(0.0, index=df.index)
-    # 5 Adımlı Mantık (Yüzdesel)
+    
+    # 1. Kısa Vade (5 Günlük Yön)
     s1 = np.sign(df['close'].pct_change(5).fillna(0))
+    # 2. Orta Vade (30 Günlük Yön)
     s2 = np.sign(df['close'].pct_change(30).fillna(0))
-    s3 = np.where(df['close'].pct_change(150) < -0.3, 1, 0) 
+    # 3. Uzun Vade (Mean Reversion Tersi: Çok düştüyse alma, trende bak)
+    s3 = np.where(df['close'] > df['close'].rolling(150).mean(), 1, -1)
+    # 4. Volatilite (Düşüyorsa iyi)
     vol = df['close'].pct_change().rolling(20).std()
     s4 = np.where(vol < vol.shift(1), 1, -1)
+    # 5. Momentum (Fark)
     s5 = np.sign(df['close'].diff(10).fillna(0))
-    total = (s1 + s2 + s3 + s4 + s5) / 5.0
-    return total
+    
+    # Normalize et (-1 ile 1 arasına)
+    return (s1 + s2 + s3 + s4 + s5) / 5.0
 
 def get_raw_data(ticker):
     try:
@@ -140,32 +149,30 @@ def process_data(df, timeframe):
     else: df_res = df.copy()
     
     if len(df_res) < 150: return None
+    
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
     df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
+    # SENİN PUANIN BURADA HESAPLANIYOR VE TABLOYA GİRİYOR
     df_res['heuristic'] = calculate_heuristic_score(df_res)
     df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
     df_res.dropna(inplace=True)
     return df_res
 
-def train_validate_and_predict(df):
+def train_meta_learner(df):
     """
-    Train/Test ayrımı yapar, Modelleri Eğitir, Ağırlıkları Öğrenir ve
-    Geriye dönük SİMÜLASYON verilerini hazırlar.
+    BU FONKSİYON, SENİN PUANINLA AI MODELLERİNİ YARIŞTIRIR.
     """
-    # Son 60 gün VALIDATION/TEST seti
     test_size = 60
-    if len(df) < test_size + 100: return 0.0, {}, None
-    
     train = df.iloc[:-test_size]
     test = df.iloc[-test_size:]
     
-    # 1. BASE EĞİTİM
+    # 1. Alt Modelleri Eğit
     X_train = train[['log_ret', 'range', 'heuristic']]
     y_train = train['target']
     
-    rf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1).fit(X_train, y_train)
-    xgb_clf = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3, n_jobs=-1).fit(X_train, y_train)
+    rf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42).fit(X_train, y_train)
+    xgb_clf = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3).fit(X_train, y_train)
     
     scaler = StandardScaler()
     X_hmm = scaler.fit_transform(train[['log_ret', 'range']])
@@ -173,221 +180,191 @@ def train_validate_and_predict(df):
     try: hmm.fit(X_hmm)
     except: hmm = None
 
-    # 2. META-MODEL EĞİTİMİ (Logistic Reg. ile Ağırlık Öğrenme)
-    # HMM Sinyali Üret
+    # 2. META-MODEL (JÜRİ) EĞİTİMİ
+    # Jüriye şunu gösteriyoruz: "Bak RF bunu dedi, XGB bunu dedi, Heuristic bunu dedi. Sonuç ne oldu?"
+    
+    # HMM Sinyali Hazırla
     hmm_pred = np.zeros(len(train))
     if hmm:
         probs = hmm.predict_proba(X_hmm)
-        bull_idx = np.argmax(hmm.means_[:, 0])
-        bear_idx = np.argmin(hmm.means_[:, 0])
-        hmm_pred = probs[:, bull_idx] - probs[:, bear_idx]
+        bull = np.argmax(hmm.means_[:, 0]); bear = np.argmin(hmm.means_[:, 0])
+        hmm_pred = probs[:, bull] - probs[:, bear]
     
+    # Jüri Girdisi (Stacking Data)
     meta_X = pd.DataFrame({
         'RF': rf.predict_proba(X_train)[:, 1],
         'XGB': xgb_clf.predict_proba(X_train)[:, 1],
         'HMM': hmm_pred,
-        'Heuristic': train['heuristic'].values
+        'Heuristic': train['heuristic'].values # SENİN PUANIN BURADA JÜRİYE GİRİYOR
     })
+    
+    # Lojistik Regresyon Jüri
     meta_model = LogisticRegression().fit(meta_X, y_train)
     
-    # Öğrenilen Ağırlıklar
-    weights = meta_model.coef_[0] 
-    # Ağırlıkları normalize et (grafik için)
-    abs_w = np.abs(weights)
-    norm_w = abs_w / (np.sum(abs_w) + 1e-9) * 100
+    # Ağırlıkları Çek (Kim ne kadar etkili?)
+    weights = meta_model.coef_[0] # [RF_w, XGB_w, HMM_w, Heuristic_w]
     
-    # 3. VALIDATION SİMÜLASYONU (Geçmiş 60 gün ne yapardı?)
-    # Test setindeki her gün için tahmin yap ve sanal cüzdan yönet
+    # 3. SİMÜLASYON VE SONUÇ (Test Verisi Üzerinde)
+    # ... (Simülasyon kodları buraya) ...
     
-    sim_equity = [100] # 100$ ile başla
-    hodl_equity = [100]
-    cash = 100
-    coin = 0
-    start_price = test['close'].iloc[0]
+    # Son Karar İçin Veri Hazırla (Şimdiki Zaman)
+    last_row = df.iloc[[-1]]
     
-    # HMM Test Sinyalleri
-    X_hmm_test = scaler.transform(test[['log_ret', 'range']])
-    hmm_test_probs = hmm.predict_proba(X_hmm_test) if hmm else np.zeros((len(test), 3))
-    hmm_test_sig = hmm_test_probs[:, bull_idx] - hmm_test_probs[:, bear_idx] if hmm else np.zeros(len(test))
+    curr_rf = rf.predict_proba(last_row[['log_ret', 'range', 'heuristic']])[0][1]
+    curr_xgb = xgb_clf.predict_proba(last_row[['log_ret', 'range', 'heuristic']])[0][1]
+    curr_heur = last_row['heuristic'].values[0]
     
-    # Diğer Test Sinyalleri
-    rf_test = rf.predict_proba(test[['log_ret', 'range', 'heuristic']])[:, 1]
-    xgb_test = xgb_clf.predict_proba(test[['log_ret', 'range', 'heuristic']])[:, 1]
+    curr_hmm = 0.0
+    if hmm:
+        ft = scaler.transform(last_row[['log_ret', 'range']])
+        p = hmm.predict_proba(ft)[0]
+        curr_hmm = p[np.argmax(hmm.means_[:, 0])] - p[np.argmin(hmm.means_[:, 0])]
+        
+    # Jüri Kararı
+    meta_input = pd.DataFrame([[curr_rf, curr_xgb, curr_hmm, curr_heur]], columns=['RF', 'XGB', 'HMM', 'Heuristic'])
+    final_prob = meta_model.predict_proba(meta_input)[0][1]
     
-    # Meta Input Test
-    meta_X_test = pd.DataFrame({
-        'RF': rf_test, 'XGB': xgb_test, 'HMM': hmm_test_sig, 'Heuristic': test['heuristic'].values
+    # Simülasyon (Hızlı)
+    sim_eq = [100]; hodl_eq = [100]; cash=100; coin=0; p0 = test['close'].iloc[0]
+    
+    # Test seti tahminleri
+    X_hmm_t = scaler.transform(test[['log_ret', 'range']])
+    hmm_p_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
+    hmm_s_t = hmm_p_t[:, np.argmax(hmm.means_[:,0])] - hmm_p_t[:, np.argmin(hmm.means_[:,0])] if hmm else np.zeros(len(test))
+    
+    mx_test = pd.DataFrame({
+        'RF': rf.predict_proba(test[['log_ret', 'range', 'heuristic']])[:,1],
+        'XGB': xgb_clf.predict_proba(test[['log_ret', 'range', 'heuristic']])[:,1],
+        'HMM': hmm_s_t,
+        'Heuristic': test['heuristic'].values
     })
-    
-    # Gün Gün Simülasyon
-    final_probs = meta_model.predict_proba(meta_X_test)[:, 1]
+    f_probs = meta_model.predict_proba(mx_test)[:,1]
     
     for i in range(len(test)):
-        price = test['close'].iloc[i]
-        sig = (final_probs[i] - 0.5) * 2
+        pr = test['close'].iloc[i]
+        s = (f_probs[i]-0.5)*2
+        if s>0.2 and cash>0: coin=cash/pr; cash=0
+        elif s<-0.2 and coin>0: cash=coin*pr; coin=0
+        sim_eq.append(cash+coin*pr)
+        hodl_eq.append((100/p0)*pr)
         
-        # İşlem (Sanal)
-        if sig > 0.20 and cash > 0: # AL
-            coin = cash / price; cash = 0
-        elif sig < -0.20 and coin > 0: # SAT
-            cash = coin * price; coin = 0
-            
-        current_val = cash + (coin * price)
-        sim_equity.append(current_val)
-        
-        # HODL
-        hodl_val = (100 / start_price) * price
-        hodl_equity.append(hodl_val)
-        
-    simulation_data = {
-        "dates": test.index,
-        "bot_eq": sim_equity[1:], # İlk gün hariç (uzunluk eşitleme)
-        "hodl_eq": hodl_equity[1:],
-        "bot_roi": (sim_equity[-1] - 100),
-        "hodl_roi": (hodl_equity[-1] - 100)
+    info = {
+        "weights": weights,
+        "bot_eq": sim_eq[1:], "hodl_eq": hodl_eq[1:], "dates": test.index,
+        "alpha": (sim_eq[-1]-hodl_eq[-1]),
+        "conf": final_prob,
+        "my_score": curr_heur
     }
+    return (final_prob-0.5)*2, info
 
-    # 4. ŞİMDİKİ KARAR (Son bar)
-    last_row = df.iloc[[-1]]
-    # ... (Burada son bar için özellik üretimi) ...
-    # Basitçe son test verisini kullanabiliriz çünkü son bar orada
-    final_signal = (final_probs[-1] - 0.5) * 2
-    
-    model_info = {
-        "weights": norm_w, # [RF, XGB, HMM, Heuristic]
-        "simulation": simulation_data,
-        "ai_confidence": final_probs[-1]
-    }
-    
-    return final_signal, model_info
-
-def analyze_ticker(ticker, status_placeholder):
+def analyze_ticker_smart(ticker, status_placeholder):
     raw_df = get_raw_data(ticker)
     if raw_df is None: 
         status_placeholder.error("Veri Yok")
-        return "HATA", 0.0, "YOK", {}
+        return "HATA", 0.0, "YOK", None
     
     current_price = float(raw_df['close'].iloc[-1])
     timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W'}
-    
-    best_sig = -99; decision = "BEKLE"; win_tf = "YOK"; best_info = {}
+    best_s = -99; decision = "BEKLE"; win_tf = "YOK"; best_inf = None
     
     for tf_name, tf_code in timeframes.items():
-        status_placeholder.text(f"{tf_name} simülasyonu yapılıyor...")
+        status_placeholder.text(f"{tf_name} analiz ediliyor...")
         df = process_data(raw_df, tf_code)
         if df is None: continue
         
-        sig, info = train_validate_and_predict(df)
+        sig, info = train_meta_learner(df)
         
-        if abs(sig) > best_sig:
-            best_sig = abs(sig)
+        if abs(sig) > best_s:
+            best_s = abs(sig)
             win_tf = tf_name
-            best_info = info
-            if sig > 0.20: decision = "AL"
-            elif sig < -0.20: decision = "SAT"
+            best_inf = info
+            if sig > 0.25: decision = "AL"
+            elif sig < -0.25: decision = "SAT"
             else: decision = "BEKLE"
             
-    return decision, current_price, win_tf, best_info
+    return decision, current_price, win_tf, best_inf
 
 # =============================================================================
 # 4. ARAYÜZ VE ÇALIŞTIRMA
 # =============================================================================
 
-if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
-    tz = pytz.timezone('Europe/Istanbul')
-    time_str = datetime.now(tz).strftime("%d-%m %H:%M")
-    
-    with st.spinner("Veritabanı (Sheets) açılıyor..."):
-        pf_df, sheet = load_and_fix_portfolio()
+if st.button("🚀 ANALİZİ BAŞLAT (OTONOM JÜRİ)", type="primary"):
+    pf_df, sheet = load_and_fix_portfolio()
     
     if pf_df.empty:
-        st.error("Portföy yüklenemedi.")
+        st.error("Portföy hatası. Tekrar deneyin.")
     else:
-        updated_pf = pf_df.copy()
+        updated = pf_df.copy()
         prog = st.progress(0)
+        tz = pytz.timezone('Europe/Istanbul')
+        time_str = datetime.now(tz).strftime("%d-%m %H:%M")
         
-        for i, (idx, row) in enumerate(updated_pf.iterrows()):
+        for i, (idx, row) in enumerate(updated.iterrows()):
             ticker = row['Ticker']
             if len(str(ticker)) < 3: continue
             
-            with st.expander(f"🔍 {ticker} Analiz Raporu", expanded=False):
+            with st.expander(f"🧠 {ticker} Analiz Raporu", expanded=True):
                 ph = st.empty()
-                dec, prc, tf, info = analyze_ticker(ticker, ph)
+                dec, prc, tf, info = analyze_ticker_smart(ticker, ph)
                 
                 if dec != "HATA" and info:
-                    # --- 1. DETAYLI MODEL RAPORU (İSTEDİĞİN YER) ---
-                    c1, c2 = st.columns([1, 2])
+                    w = info['weights']
+                    # Normalize et (Görsellik için, negatifleri mutlak alıp oranla)
+                    w_abs = np.abs(w)
+                    w_norm = w_abs / np.sum(w_abs)
                     
+                    c1, c2 = st.columns([1, 2])
                     with c1:
-                        st.markdown(f"### 🧠 Model Kararı: {dec}")
-                        st.markdown(f"**Zaman Dilimi:** {tf}")
-                        st.markdown(f"**Fiyat:** ${prc:.2f}")
-                        st.markdown(f"**AI Güveni:** %{info['ai_confidence']*100:.1f}")
-                        
-                        # Ağırlık Tablosu
-                        w = info['weights']
+                        st.markdown(f"### Karar: {dec}")
+                        st.markdown(f"**Senin Puanın:** {info['my_score']:.2f}")
+                        st.markdown("**Modelin Güven Ağırlıkları:**")
                         w_df = pd.DataFrame({
-                            'Model': ['RandomForest', 'XGBoost', 'HMM', 'Senin Kuralın'],
-                            'Etki (%)': [w[0], w[1], w[2], w[3]]
+                            'Kaynak': ['RandomForest', 'XGBoost', 'HMM', 'Senin Kuralın'],
+                            'Güven (%)': w_norm * 100
                         })
                         st.dataframe(w_df, hide_index=True)
-
+                    
                     with c2:
-                        # SİMÜLASYON GRAFİĞİ
-                        sim = info['simulation']
-                        fig = make_subplots(specs=[[{"secondary_y": False}]])
-                        fig.add_trace(go.Scatter(x=sim['dates'], y=sim['bot_eq'], name="Bot (Simüle)", line=dict(color='green', width=2)))
-                        fig.add_trace(go.Scatter(x=sim['dates'], y=sim['hodl_eq'], name="HODL", line=dict(color='gray', dash='dot')))
+                        # Grafik
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=info['dates'], y=info['bot_eq'], name="Bot", line=dict(color='green')))
+                        fig.add_trace(go.Scatter(x=info['dates'], y=info['hodl_eq'], name="HODL", line=dict(color='gray', dash='dot')))
                         
-                        alpha = sim['bot_roi'] - sim['hodl_roi']
-                        title_color = "green" if alpha > 0 else "red"
-                        fig.update_layout(
-                            title=f"Son 60 Gün Validasyon Testi | Alpha: %{alpha:.1f}",
-                            title_font_color=title_color,
-                            height=300, margin=dict(l=0, r=0, t=30, b=0),
-                            template="plotly_dark", showlegend=True
-                        )
+                        alpha_val = info['alpha']
+                        color_ti = "green" if alpha_val > 0 else "red"
+                        fig.update_layout(title=f"Validation Alpha: ${alpha_val:.2f}", title_font_color=color_ti, height=250, template="plotly_dark", margin=dict(t=30,b=0,l=0,r=0))
                         st.plotly_chart(fig, use_container_width=True)
-
-                    # --- İŞLEM KAYDI ---
-                    status = row['Durum']
-                    if status == 'COIN' and dec == 'SAT':
+                        
+                    # İşlem Kaydı
+                    stt = row['Durum']
+                    if stt == 'COIN' and dec == 'SAT':
                         amt = float(row['Miktar'])
                         if amt > 0:
-                            updated_pf.at[idx, 'Durum'] = 'CASH'; updated_pf.at[idx, 'Nakit_Bakiye_USD'] = amt * prc
-                            updated_pf.at[idx, 'Miktar'] = 0.0; updated_pf.at[idx, 'Son_Islem_Fiyati'] = prc
-                            updated_pf.at[idx, 'Son_Islem_Log'] = f"SAT ({tf})"; updated_pf.at[idx, 'Son_Islem_Zamani'] = time_str
-                    elif status == 'CASH' and dec == 'AL':
+                            updated.at[idx, 'Durum'] = 'CASH'; updated.at[idx, 'Nakit_Bakiye_USD'] = amt * prc
+                            updated.at[idx, 'Miktar'] = 0.0; updated.at[idx, 'Son_Islem_Fiyati'] = prc
+                            updated.at[idx, 'Son_Islem_Log'] = f"SAT ({tf}) A:{alpha_val:.1f}"; updated.at[idx, 'Son_Islem_Zamani'] = time_str
+                    elif stt == 'CASH' and dec == 'AL':
                         cash = float(row['Nakit_Bakiye_USD'])
                         if cash > 1:
-                            updated_pf.at[idx, 'Durum'] = 'COIN'; updated_pf.at[idx, 'Miktar'] = cash / prc
-                            updated_pf.at[idx, 'Nakit_Bakiye_USD'] = 0.0; updated_pf.at[idx, 'Son_Islem_Fiyati'] = prc
-                            updated_pf.at[idx, 'Son_Islem_Log'] = f"AL ({tf})"; updated_pf.at[idx, 'Son_Islem_Zamani'] = time_str
+                            updated.at[idx, 'Durum'] = 'COIN'; updated.at[idx, 'Miktar'] = cash / prc
+                            updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0; updated.at[idx, 'Son_Islem_Fiyati'] = prc
+                            updated.at[idx, 'Son_Islem_Log'] = f"AL ({tf}) A:{alpha_val:.1f}"; updated.at[idx, 'Son_Islem_Zamani'] = time_str
                     
-                    val = (float(updated_pf.at[idx, 'Miktar']) * prc) if updated_pf.at[idx, 'Durum'] == 'COIN' else float(updated_pf.at[idx, 'Nakit_Bakiye_USD'])
-                    updated_pf.at[idx, 'Kaydedilen_Deger_USD'] = val
-                    
-                    ph.success(f"Analiz Tamamlandı. Karar: {dec}")
+                    val = (float(updated.at[idx, 'Miktar']) * prc) if updated.at[idx, 'Durum'] == 'COIN' else float(updated.at[idx, 'Nakit_Bakiye_USD'])
+                    updated.at[idx, 'Kaydedilen_Deger_USD'] = val
+                    ph.success("Analiz Tamamlandı")
 
-            prog.progress((i+1)/len(updated_pf))
+            prog.progress((i+1)/len(updated))
         
-        save_portfolio(updated_pf, sheet)
-        st.success("✅ TÜM İŞLEMLER TAMAMLANDI!")
+        save_portfolio(updated, sheet)
+        st.success("✅ Tüm Analizler Bitti!")
 
-# LİSTELEME
 st.divider()
 try:
     df_v, _ = load_and_fix_portfolio()
     if not df_v.empty:
-        st.subheader("📋 Mevcut Portföy Durumu")
+        st.subheader("📋 Mevcut Portföy")
         st.dataframe(df_v)
-        
-        total = df_v['Kaydedilen_Deger_USD'].sum()
-        start_cap = df_v['Baslangic_USD'].sum()
-        pnl = total - start_cap
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Toplam Varlık", f"${total:.2f}")
-        c2.metric("Net Kâr/Zarar", f"${pnl:.2f}", f"%{(pnl/start_cap)*100:.2f}" if start_cap>0 else "0%")
-        c3.metric("Bot Durumu", "Aktif", "Otonom")
+        tot = df_v['Kaydedilen_Deger_USD'].sum()
+        st.metric("Toplam Varlık", f"${tot:.2f}")
 except: pass
