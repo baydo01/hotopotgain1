@@ -2,6 +2,8 @@ from sklearn.decomposition import PCA
 from arch import arch_model
 from pyearth import Earth
 from statsmodels.tsa.arima.model import ARIMA
+pip install git+https://github.com/scikit-learn-contrib/py-earth.git
+
 
 def train_meta_learner(df, params=None):
     rf_d = params['rf_depth'] if params else 5
@@ -122,3 +124,4 @@ def train_meta_learner(df, params=None):
           'bot_roi': (sim_eq[-1]-100),'hodl_roi': (hodl_eq[-1]-100),
           'conf': probs[-1],'my_score': test['heuristic'].iloc[-1]}
     return final_signal, info
+
