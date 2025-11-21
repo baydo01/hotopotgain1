@@ -1,6 +1,29 @@
 # trader_bot_full_engine_v3.py
 # Hedge Fund AI — BEAST MODE v3
 # v2 engine + meta-learner augmentation with PCA, ARIMA, ARCH, Earth
+# ---------------------------
+# Gerekli paketler (requirements.txt için):
+"""
+streamlit
+yfinance
+pandas
+numpy
+plotly
+gspread
+oauth2client
+hmmlearn
+scikit-learn
+xgboost
+lightgbm
+pyearth
+statsmodels
+arch
+deap
+optuna
+numba
+openpyxl
+"""
+# ---------------------------
 
 import streamlit as st
 import yfinance as yf
@@ -117,14 +140,22 @@ def load_and_fix_portfolio(target_coins=DEFAULT_TARGET_COINS):
     except Exception:
         return pd.DataFrame(), sheet
 
-def save_portfolio(df, sheet):
-    if sheet is None: return
+def save_portfolio(df, sheet=None, excel_path="portfolio_output.xlsx"):
+    # Google Sheets kaydı
+    if sheet is not None:
+        try:
+            df_export = df.astype(str)
+            sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
+            logger.info("Portfolio saved to Google Sheet.")
+        except Exception:
+            logger.exception("Failed to save portfolio to Google Sheet")
+    
+    # Lokal Excel kaydı
     try:
-        df_export = df.astype(str)
-        sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
-        logger.info("Portfolio saved to sheet.")
+        df.to_excel(excel_path, index=False)
+        logger.info(f"Portfolio saved locally as {excel_path}")
     except Exception:
-        logger.exception("Failed to save portfolio to sheet")
+        logger.exception("Failed to save portfolio locally")
 
 # ---------------------------
 # CACHING / DATA LOADING
@@ -281,14 +312,6 @@ def train_meta_learner(df, params=None):
     return meta_model, {'RF':rf,'XGB':xgb_c,'LGBM':lgb_c,'PCA':pca,'Earth':earth_model}
 
 # ---------------------------
-# SIMULATION, GA, OPTUNA, TRAIN & STREAMLIT
-# ---------------------------
-# Burada beast v2 ile aynı mantığı koru ve analyze_ticker_beast_v2() içinde
-# train_meta_learner() ile stack/ensemble yap.
-# Diğer kodlar (simulate_strategy_from_probs, walk_forward_splits, run_heavy_ga_improved, run_optuna_search)
-# aynı şekilde kalabilir, sadece meta_model çıktısı olarak v3 modellerini kullan.
-
-# ---------------------------
 # Streamlit UI
 # ---------------------------
 if st.button("🦍 CANAVAR MODU v3 BAŞLAT"):
@@ -307,6 +330,6 @@ if st.button("🦍 CANAVAR MODU v3 BAŞLAT"):
                 dec, prc, tf, info = analyze_ticker_beast_v2(
                     ticker, ph, use_optuna_flag=use_optuna, n_gen=max_gens, pop_size=pop_size, tx_cost_pct=tx_cost_perc, parallel=use_parallel
                 )
-                # Sim summary, Streamlit görselleştirme vs. v2 ile aynı
                 prog.progress((i+1)/len(updated))
-        save_portfolio(updated, sheet)
+        save_portfolio(updated, sheet, excel_path="portfolio_output.xlsx")
+        st.success("Portföy kaydedildi ✅ (Google Sheets ve lokal Excel)")
