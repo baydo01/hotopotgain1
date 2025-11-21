@@ -16,7 +16,6 @@ sklearn-contrib-py-earth
 streamlit
 xgboost
 yfinance
-
 streamlit
 yfinance
 pandas
@@ -28,10 +27,10 @@ hmmlearn
 scikit-learn
 xgboost
 lightgbm
-pyearth
 statsmodels
 arch
 deap
 optuna
 numba
 openpyxl
+
