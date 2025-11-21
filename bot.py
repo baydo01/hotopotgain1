@@ -1,3 +1,4 @@
+pip install git+https://github.com/scikit-learn-contrib/py-earth.git
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -368,3 +369,4 @@ try:
     df_view, _ = load_and_fix_portfolio()
     if not df_view.empty: st.dataframe(df_view)
 except: pass
+
