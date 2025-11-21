@@ -13,6 +13,19 @@ seaborn
 streamlit
 xgboost
 yfinance
+streamlit
+yfinance
+pandas
+numpy
+hmmlearn
+scikit-learn
+xgboost
+lightgbm
+plotly
+gspread
+google-auth
+oauth2client
+deap
 
 streamlit
 yfinance
@@ -26,3 +39,4 @@ gspread
 google-auth
 oauth2client
 deap
+
