@@ -15,6 +15,14 @@ xgboost
 yfinance
 streamlit
 yfinance
+arch
+pandas
+numpy
+scikit-learn
+xgboost
+lightgbm
+streamlit
+
 pandas
 numpy
 hmmlearn
@@ -39,4 +47,5 @@ gspread
 google-auth
 oauth2client
 deap
+
 
