@@ -254,7 +254,6 @@ def train_meta_learner(df, params=None):
     rf = RandomForestClassifier(n_estimators=rf_est,max_depth=rf_depth,n_jobs=-1,random_state=seed).fit(df[X_cols],y)
     xgb_c = xgb.XGBClassifier(n_estimators=50,max_depth=rf_depth,learning_rate=0.05,verbosity=0,use_label_encoder=False,eval_metric='logloss').fit(df[X_cols],y)
     lgb_c = lgb.LGBMClassifier(n_estimators=50,learning_rate=0.05,verbose=-1).fit(df[X_cols],y)
-    # GBM alternative for Earth
     gbm_c = GradientBoostingClassifier(n_estimators=50,max_depth=rf_depth,learning_rate=0.05).fit(df[X_cols],y)
     
     # PCA feature
@@ -282,6 +281,19 @@ def train_meta_learner(df, params=None):
     return meta_model, {'RF':rf,'XGB':xgb_c,'LGBM':lgb_c,'GBM':gbm_c,'PCA':pca}
 
 # ---------------------------
+# PLACEHOLDER: ANALYZE TICKER FUNCTION
+# ---------------------------
+def analyze_ticker_beast_v2(ticker, st_placeholder, use_optuna_flag=False, n_gen=8, pop_size=24, tx_cost_pct=0.05, parallel=True):
+    df_raw = get_raw_data_cached(ticker)
+    df_proc = process_data(df_raw)
+    if df_proc is None:
+        st_placeholder.error("Veri eksik veya yetersiz")
+        return None, None, None, None
+    model, models_dict = train_meta_learner(df_proc)
+    st_placeholder.success(f"{ticker} meta-learner hazır!")
+    return "BUY/SELL_DEC", df_proc['close'], df_proc, {"models":models_dict}
+
+# ---------------------------
 # STREAMLIT RUN
 # ---------------------------
 if st.button("🦍 CANAVAR MODU v4 BAŞLAT"):
@@ -302,3 +314,4 @@ if st.button("🦍 CANAVAR MODU v4 BAŞLAT"):
                 )
                 prog.progress((i+1)/len(updated))
         save_portfolio(updated, sheet)
+        st.success("Portföy güncellendi ve işlemler kaydedildi.")
