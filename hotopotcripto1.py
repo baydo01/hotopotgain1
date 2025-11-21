@@ -1,4 +1,3 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -10,35 +9,22 @@ import warnings
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import streamlit as st
-
-# Google Sheets yetki scope
-scope = ["https://spreadsheets.google.com/feeds",
-         "https://www.googleapis.com/auth/drive"]
-
-# Secrets’dan JSON key al
-json_key = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT_KEY"])
-creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key, scope)
-
-# Google Sheets'e bağlan
-client = gspread.authorize(creds)
-sheet_id = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
-sheet = client.open_by_key(sheet_id).sheet1
 
 warnings.filterwarnings("ignore")
 
-# --- GOOGLE SHEETS ---
-SHEET_NAME = "hedge_fund_portfolio"
-JSON_KEYFILE = "hedgebot.json"
+# -----------------------------
+# Google Sheets bağlantısı
+# -----------------------------
+SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
 
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEYFILE, scope)
+    # Secrets'dan JSON key al
+    json_key = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT_KEY"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json_key, scope)
     client = gspread.authorize(creds)
-    sheet = client.open(SHEET_NAME).sheet1
+    sheet = client.open_by_key(SHEET_ID).sheet1
     return sheet
 
 def save_to_google_sheets(df):
@@ -51,7 +37,9 @@ def load_from_google_sheets():
     data = sheet.get_all_records()
     return pd.DataFrame(data)
 
-# --- STREAMLIT HAFIZA ---
+# -----------------------------
+# Streamlit hafıza/log
+# -----------------------------
 if 'logs' not in st.session_state:
     st.session_state.logs = []
 
@@ -68,7 +56,9 @@ def load_portfolio():
 def save_portfolio(df):
     save_to_google_sheets(df)
 
-# --- PORTFÖY İNİT ---
+# -----------------------------
+# Simülasyon başlat
+# -----------------------------
 def init_simulation(tickers, amount_per_coin=10):
     data = []
     progress_bar = st.progress(0)
@@ -77,7 +67,6 @@ def init_simulation(tickers, amount_per_coin=10):
     for i, ticker in enumerate(tickers):
         status_text.text(f"{ticker} için piyasa verisi alınıyor...")
         df_price = get_data_cached(ticker)
-        
         if df_price is not None:
             current_price = df_price['close'].iloc[-1]
             coin_amount = amount_per_coin / current_price
@@ -100,7 +89,9 @@ def init_simulation(tickers, amount_per_coin=10):
     progress_bar.empty()
     return df
 
-# --- VERİ VE ANALİZ ---
+# -----------------------------
+# Veri ve HMM analizi
+# -----------------------------
 def calculate_custom_score(df):
     if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(10), 1, -1)
@@ -168,7 +159,9 @@ def get_bulk_signals(tickers):
     progress.empty()
     return pd.DataFrame(results)
 
-# --- BOT LOGİK ---
+# -----------------------------
+# Portföy güncelleme mantığı
+# -----------------------------
 def run_bot_logic(portfolio_df, signals_df):
     updated_portfolio = portfolio_df.copy()
     for idx, row in updated_portfolio.iterrows():
@@ -197,8 +190,10 @@ def run_bot_logic(portfolio_df, signals_df):
     save_portfolio(updated_portfolio)
     return updated_portfolio
 
-# --- STREAMLIT ARAYÜZ ---
-st.set_page_config(page_title="Hedge Fund Bot: Sheets Edition", layout="wide", initial_sidebar_state="collapsed")
+# -----------------------------
+# Streamlit arayüz
+# -----------------------------
+st.set_page_config(page_title="Hedge Fund Bot: Sheets Edition", layout="wide")
 st.title("🧠 Hedge Fund Bot: Google Sheets Edition")
 
 # Sidebar
@@ -281,6 +276,3 @@ else:
         "Fiyat":"${:.2f}", "Değer ($)":"${:.2f}",
         "Kâr/Zarar ($)":"{:+.2f}", "Kâr/Zarar (%)":"{:+.2f}%"
     }))
-
-
-
