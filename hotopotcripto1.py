@@ -34,13 +34,11 @@ CREDENTIALS_FILE = "service_account.json"
 
 st.title("🏦 Hedge Fund AI: Canlı Yönetim Paneli")
 
-# Bilgilendirme Kutusu (İstediğin Gibi)
 st.info("""
-**🧠 MODEL MİMARİSİ & VERİ SETİ AYRIMI**
-* **Train Data (Eğitim):** Geçmiş verilerin %80'i.
-* **Validation (Doğrulama):** Test öncesi **30 Günlük** ince ayar dönemi.
-* **Test Data (Sınav):** Son **60 Günlük** veri (Modelin başarısı burada ölçülür).
+**🧠 MODEL MİMARİSİ**
 * **Teknoloji:** Kalman Filtresi + HMM (Rejim) + XGBoost + Random Forest.
+* **Yöntem:** Her coin için Günlük/Haftalık/Aylık grafikleri yarıştırır, en iyisini seçer.
+* **Hedef:** Google Sheets portföyünü canlı yönetmek.
 """)
 
 with st.sidebar:
@@ -49,17 +47,21 @@ with st.sidebar:
     ga_gens = st.number_input("GA Jenerasyon Sayısı", 1, 50, 5)
 
 # =============================================================================
-# 2. GOOGLE SHEETS BAĞLANTISI (SATIR GÜNCELLEME MANTIKLI)
+# 2. GOOGLE SHEETS BAĞLANTISI (OTO-KURULUM DAHİL)
 # =============================================================================
 
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = None
+    
+    # 1. Streamlit Secrets Kontrolü
     if "gcp_service_account" in st.secrets:
         try:
             creds_dict = dict(st.secrets["gcp_service_account"])
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         except: pass
+    
+    # 2. Yerel Dosya Kontrolü
     if not creds and os.path.exists(CREDENTIALS_FILE):
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         
@@ -84,16 +86,20 @@ def load_portfolio():
                          "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", 
                          "Son_Islem_Log", "Son_Islem_Zamani"]
         
+        # Eğer sayfa boşsa veya başlıklar yanlışsa -> TABLOYU SIFIRDAN KUR
         if not headers or headers[0] != "Ticker":
-            st.warning("⚠️ Tablo formatı bozuk, otomatik düzeltiliyor...")
+            st.warning("⚠️ Tablo formatı bozuk veya boş, MANTIKLI 6'LI ile kuruluyor...")
             sheet.clear()
             sheet.append_row(required_cols)
-            # Varsayılan Coinleri Ekle
+            
+            # İSTEDİĞİN 6 COIN (10$ Başlangıç)
             defaults = [
                 ["BTC-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"],
                 ["ETH-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"],
                 ["SOL-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"],
-                ["AVAX-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"]
+                ["BNB-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"],
+                ["XRP-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"],
+                ["DOGE-USD", "CASH", 0, 0, 10, 10, 10, "BAŞLANGIÇ", "-"]
             ]
             for d in defaults: sheet.append_row(d)
             st.success("✅ Tablo oluşturuldu.")
@@ -257,12 +263,12 @@ def ga_optimize(df, n_gen=5):
     except: return None
 
 # =============================================================================
-# 4. ANALİZ VE GÖRSELLEŞTİRME (SENİN İSTEDİĞİN KISIM)
+# 4. ANALİZ VE GÖRSELLEŞTİRME (Görsel Arayüz Kısmı)
 # =============================================================================
 
 def analyze_and_plot(ticker, status_placeholder):
     """
-    Hem analiz yapar hem de ekrana grafikleri ve yazıları basar.
+    Analiz yapar ve ekrana grafik basar.
     """
     status_placeholder.markdown(f"### 🔄 {ticker} Verileri Çekiliyor...")
     raw_df = get_raw_data(ticker)
@@ -314,12 +320,6 @@ def analyze_and_plot(ticker, status_placeholder):
         # Kalman Filtresi (Trend)
         fig.add_trace(go.Scatter(x=winning_df.index, y=winning_df['kalman_close'], name='AI Trend (Kalman)', line=dict(color='cyan', width=2)))
         
-        # Senelik Çizgiler
-        years = winning_df.index.year.unique()
-        for y in years:
-            first_day = winning_df[winning_df.index.year == y].index[0]
-            fig.add_vline(x=first_day, line_width=1, line_dash="dash", line_color="white", opacity=0.3)
-
         fig.update_layout(title=f"{ticker} - {winning_tf} Analizi (Kalman AI)", template="plotly_dark", height=300)
         st.plotly_chart(fig, use_container_width=True)
 
