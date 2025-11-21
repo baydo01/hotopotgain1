@@ -1,3 +1,5 @@
+!pip install streamlit yfinance hmmlearn scikit-learn pandas numpy gspread oauth2client
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -6,41 +8,52 @@ from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
 import time
 import warnings
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 warnings.filterwarnings("ignore")
 
-# --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Hedge Fund Bot: RAM Edition", layout="wide", initial_sidebar_state="collapsed")
+# --- GOOGLE SHEETS ---
+SHEET_NAME = "hedge_fund_portfolio"
+JSON_KEYFILE = "hedgebot.json"
 
-# --- CSS STİL ---
-st.markdown("""
-<style>
-    .stButton>button { width: 100%; border-radius: 8px; height: 3em; font-weight: bold; }
-    div[data-testid="stMetricValue"] { font-size: 1.2rem; }
-    .stDataFrame { width: 100%; }
-</style>
-""", unsafe_allow_html=True)
+def connect_sheet():
+    scope = ["https://spreadsheets.google.com/feeds",
+             "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEYFILE, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open(SHEET_NAME).sheet1
+    return sheet
 
-# --- 🧠 HAFIZA (SESSION STATE) YÖNETİMİ ---
-# Dosya yerine Streamlit'in beynini kullanıyoruz.
-if 'portfolio' not in st.session_state:
-    st.session_state.portfolio = pd.DataFrame(columns=["Ticker", "Durum", "Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD"])
+def save_to_google_sheets(df):
+    sheet = connect_sheet()
+    sheet.clear()
+    sheet.update([df.columns.values.tolist()] + df.values.tolist())
 
+def load_from_google_sheets():
+    sheet = connect_sheet()
+    data = sheet.get_all_records()
+    return pd.DataFrame(data)
+
+# --- STREAMLIT HAFIZA ---
 if 'logs' not in st.session_state:
     st.session_state.logs = []
 
-def load_portfolio():
-    return st.session_state.portfolio
-
-def save_portfolio(df):
-    st.session_state.portfolio = df
-
 def add_log(message):
     timestamp = time.strftime("%H:%M:%S")
-    st.session_state.logs.insert(0, f"[{timestamp}] {message}") # En yeniyi başa ekle
+    st.session_state.logs.insert(0, f"[{timestamp}] {message}")
 
+def load_portfolio():
+    try:
+        return load_from_google_sheets()
+    except:
+        return pd.DataFrame(columns=["Ticker","Durum","Miktar","Son_Islem_Fiyati","Nakit_Bakiye_USD","Baslangic_USD"])
+
+def save_portfolio(df):
+    save_to_google_sheets(df)
+
+# --- PORTFÖY İNİT ---
 def init_simulation(tickers, amount_per_coin=10):
-    """Tüm coinlere başlangıçta eşit dolar yatırır ve hafızaya kaydeder."""
     data = []
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -52,7 +65,6 @@ def init_simulation(tickers, amount_per_coin=10):
         if df_price is not None:
             current_price = df_price['close'].iloc[-1]
             coin_amount = amount_per_coin / current_price
-            
             data.append({
                 "Ticker": ticker,
                 "Durum": "COIN", 
@@ -65,14 +77,14 @@ def init_simulation(tickers, amount_per_coin=10):
         
     df = pd.DataFrame(data)
     save_portfolio(df)
-    st.session_state.logs = [] # Logları temizle
-    add_log("Simülasyon başlatıldı. Portföy hafızaya yüklendi.")
+    st.session_state.logs = []
+    add_log("Simülasyon başlatıldı. Portföy Google Sheets’e kaydedildi.")
     
     status_text.empty()
     progress_bar.empty()
     return df
 
-# --- VERİ VE ANALİZ (AYNI KALDI) ---
+# --- VERİ VE ANALİZ ---
 def calculate_custom_score(df):
     if len(df) < 5: return pd.Series(0, index=df.index)
     s1 = np.where(df['close'] > df['close'].shift(10), 1, -1)
@@ -115,12 +127,10 @@ def get_bulk_signals(tickers):
                 continue
                 
             df = prepare_data(df)
-            
-            X = df[['log_ret', 'range']].values
+            X = df[['log_ret','range']].values
             scaler = StandardScaler()
             X_s = scaler.fit_transform(X)
-            
-            model = GaussianHMM(n_components=3, covariance_type="full", n_iter=50, random_state=42, verbose=False)
+            model = GaussianHMM(n_components=3, covariance_type="full", n_iter=50, random_state=42)
             model.fit(X_s)
             states = model.predict(X_s)
             
@@ -132,62 +142,48 @@ def get_bulk_signals(tickers):
             hmm_signal = 1 if last_state == bull_state else (-1 if last_state == bear_state else 0)
             score = df['custom_score'].iloc[-1]
             score_signal = 1 if score > 0 else (-1 if score < 0 else 0)
-            
-            final_val = 0.6 * hmm_signal + 0.4 * score_signal
+            final_val = 0.6*hmm_signal + 0.4*score_signal
             decision = "AL" if final_val > 0.2 else ("SAT" if final_val < -0.2 else "BEKLE")
             
-            results.append({
-                "Ticker": ticker,
-                "Sinyal": decision,
-                "Fiyat": df['close'].iloc[-1],
-                "Skor": int(score)
-            })
-            
+            results.append({"Ticker":ticker,"Sinyal":decision,"Fiyat":df['close'].iloc[-1],"Skor":int(score)})
         except:
-            results.append({"Ticker": ticker, "Sinyal": "HATA", "Fiyat": 0, "Skor": 0})
-            
+            results.append({"Ticker":ticker,"Sinyal":"HATA","Fiyat":0,"Skor":0})
         progress.progress((i+1)/len(tickers))
-    
     progress.empty()
     return pd.DataFrame(results)
 
-# --- BOT OTOMASYON MANTIĞI ---
+# --- BOT LOGİK ---
 def run_bot_logic(portfolio_df, signals_df):
     updated_portfolio = portfolio_df.copy()
-    
     for idx, row in updated_portfolio.iterrows():
         ticker = row['Ticker']
-        signal_row = signals_df[signals_df['Ticker'] == ticker]
-        
+        signal_row = signals_df[signals_df['Ticker']==ticker]
         if signal_row.empty: continue
-        
         current_price = signal_row.iloc[0]['Fiyat']
         signal = signal_row.iloc[0]['Sinyal']
         
-        if row['Durum'] == 'COIN' and signal == 'SAT':
-            cash_obtained = row['Miktar'] * current_price
-            updated_portfolio.at[idx, 'Durum'] = 'CASH'
-            updated_portfolio.at[idx, 'Nakit_Bakiye_USD'] = cash_obtained
-            updated_portfolio.at[idx, 'Miktar'] = 0
-            updated_portfolio.at[idx, 'Son_Islem_Fiyati'] = current_price
+        if row['Durum']=='COIN' and signal=='SAT':
+            cash_obtained = row['Miktar']*current_price
+            updated_portfolio.at[idx,'Durum']='CASH'
+            updated_portfolio.at[idx,'Nakit_Bakiye_USD']=cash_obtained
+            updated_portfolio.at[idx,'Miktar']=0
+            updated_portfolio.at[idx,'Son_Islem_Fiyati']=current_price
             add_log(f"🔴 {ticker}: SATIŞ yapıldı. (${cash_obtained:.2f})")
-            
-        elif row['Durum'] == 'CASH' and signal == 'AL':
+        elif row['Durum']=='CASH' and signal=='AL':
             cash_available = row['Nakit_Bakiye_USD']
-            if cash_available > 0:
-                new_amount = cash_available / current_price
-                updated_portfolio.at[idx, 'Durum'] = 'COIN'
-                updated_portfolio.at[idx, 'Miktar'] = new_amount
-                updated_portfolio.at[idx, 'Nakit_Bakiye_USD'] = 0
-                updated_portfolio.at[idx, 'Son_Islem_Fiyati'] = current_price
+            if cash_available>0:
+                new_amount = cash_available/current_price
+                updated_portfolio.at[idx,'Durum']='COIN'
+                updated_portfolio.at[idx,'Miktar']=new_amount
+                updated_portfolio.at[idx,'Nakit_Bakiye_USD']=0
+                updated_portfolio.at[idx,'Son_Islem_Fiyati']=current_price
                 add_log(f"🟢 {ticker}: ALIŞ yapıldı. (${cash_available:.2f})")
-    
     save_portfolio(updated_portfolio)
     return updated_portfolio
 
-# --- ARAYÜZ ---
-st.title("🧠 Hedge Fund Bot: RAM Edition")
-st.markdown("Bu modda veriler dosya yerine **geçici hafızada** tutulur. Sayfayı yenilerseniz sıfırlanır.")
+# --- STREAMLIT ARAYÜZ ---
+st.set_page_config(page_title="Hedge Fund Bot: Sheets Edition", layout="wide", initial_sidebar_state="collapsed")
+st.title("🧠 Hedge Fund Bot: Google Sheets Edition")
 
 # Sidebar
 with st.sidebar:
@@ -197,7 +193,7 @@ with st.sidebar:
     
     if st.button("⚡ SİMÜLASYONU BAŞLAT/SIFIRLA"):
         init_simulation(selected_tickers, 10)
-        st.success("Hafıza sıfırlandı, $10 yüklendi.")
+        st.success("Portföy Google Sheets’e yüklendi.")
         time.sleep(0.5)
         st.rerun()
         
@@ -210,19 +206,19 @@ with st.sidebar:
 pf_df = load_portfolio()
 
 if pf_df.empty:
-    st.info("👈 Soldaki butona basarak simülasyonu hafızaya yükle.")
+    st.info("👈 Soldaki butona basarak simülasyonu başlat.")
 else:
-    col_btn, col_info = st.columns([1, 3])
+    col_btn, col_info = st.columns([1,3])
     signals_df = None
     
     with col_btn:
-        if st.button("🔄 BOTU ÇALIŞTIR (ANALİZ ET)", type="primary"):
-            with st.spinner("Hafızadaki portföy taranıyor..."):
+        if st.button("🔄 BOTU ÇALIŞTIR (ANALİZ ET)"):
+            with st.spinner("Portföy taranıyor..."):
                 signals_df = get_bulk_signals(pf_df['Ticker'].tolist())
                 pf_df = run_bot_logic(pf_df, signals_df)
                 st.success("Analiz tamamlandı, portföy güncellendi.")
 
-    # Tablo Hazırlığı
+    # Tablo
     display_data = []
     total_balance = 0
     total_invested = pf_df['Baslangic_USD'].sum()
@@ -236,35 +232,29 @@ else:
         for _, r in signals_df.iterrows():
             current_prices[r['Ticker']] = r['Fiyat']
 
-    for idx, row in pf_df.iterrows():
-        curr_price = current_prices.get(row['Ticker'], 0)
-        
-        if row['Durum'] == 'COIN':
-            asset_val = row['Miktar'] * curr_price
-        else:
-            asset_val = row['Nakit_Bakiye_USD']
-            
-        pnl = asset_val - row['Baslangic_USD']
-        pnl_pct = (pnl / row['Baslangic_USD']) * 100
-        
+    for idx,row in pf_df.iterrows():
+        curr_price = current_prices.get(row['Ticker'],0)
+        asset_val = row['Miktar']*curr_price if row['Durum']=='COIN' else row['Nakit_Bakiye_USD']
+        pnl = asset_val-row['Baslangic_USD']
+        pnl_pct = (pnl/row['Baslangic_USD'])*100
         current_sig = "-"
         if signals_df is not None:
-            sig_row = signals_df[signals_df['Ticker'] == row['Ticker']]
-            if not sig_row.empty: current_sig = sig_row.iloc[0]['Sinyal']
-            
+            sig_row = signals_df[signals_df['Ticker']==row['Ticker']]
+            if not sig_row.empty:
+                current_sig = sig_row.iloc[0]['Sinyal']
         display_data.append({
-            "Coin": row['Ticker'],
-            "Durum": row['Durum'],
-            "Sinyal": current_sig,
-            "Fiyat": curr_price,
-            "Değer ($)": asset_val,
-            "Kâr/Zarar ($)": pnl,
-            "Kâr/Zarar (%)": pnl_pct
+            "Coin":row['Ticker'],
+            "Durum":row['Durum'],
+            "Sinyal":current_sig,
+            "Fiyat":curr_price,
+            "Değer ($)":asset_val,
+            "Kâr/Zarar ($)":pnl,
+            "Kâr/Zarar (%)":pnl_pct
         })
         total_balance += asset_val
 
     # Metrikler
-    m1, m2, m3 = st.columns(3)
+    m1,m2,m3 = st.columns(3)
     net_pnl = total_balance - total_invested
     m1.metric("Toplam Portföy", f"${total_balance:.2f}")
     m2.metric("Yatırılan", f"${total_invested:.2f}")
@@ -272,5 +262,6 @@ else:
 
     # Tablo
     st.dataframe(pd.DataFrame(display_data).style.format({
-        "Fiyat": "${:.2f}", "Değer ($)": "${:.2f}", "Kâr/Zarar ($)": "{:+.2f}", "Kâr/Zarar (%)": "{:+.2f}%"
+        "Fiyat":"${:.2f}", "Değer ($)":"${:.2f}",
+        "Kâr/Zarar ($)":"{:+.2f}", "Kâr/Zarar (%)":"{:+.2f}%"
     }))
