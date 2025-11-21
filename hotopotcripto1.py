@@ -256,7 +256,7 @@ def run_bot_logic(portfolio_df, signals_df):
     return updated_portfolio
 
 # ---------------------------------------------------------
-# ARAYÜZ (UI)
+# ARAYÜZ (UI) hotopotimko
 # ---------------------------------------------------------
 st.title("🧠 Hedge Fund Bot: Google Sheets Edition")
 
@@ -352,3 +352,4 @@ else:
         "Kâr/Zarar ($)": "{:+.2f}", 
         "Kâr/Zarar (%)": "{:+.2f}%"
     }))
+
