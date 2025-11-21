@@ -66,15 +66,25 @@ def init_simulation(tickers, amount_per_coin=10):
     data = []
     progress = st.progress(0)
     for i, ticker in enumerate(tickers):
-        df = yf.download(ticker, period="1d", progress=False)
-        if not df.empty:
-            price = float(df['Close'].iloc[-1])
-            data.append({
-                "Ticker": ticker, "Durum": "COIN", "Miktar": amount_per_coin/price,
-                "Son_Islem_Fiyati": price, "Nakit_Bakiye_USD": 0.0, "Baslangic_USD": float(amount_per_coin),
-                "Kaydedilen_Deger_USD": float(amount_per_coin), "Son_Islem_Log": "Başlangıç", "Son_Islem_Zamani": get_current_time_str()
-            })
+        # HATA DÜZELTMESİ BURADA YAPILDI (MultiIndex Handle)
+        try:
+            df = yf.download(ticker, period="1d", progress=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                
+                col_name = 'Close' if 'Close' in df.columns else 'close'
+                price = float(df[col_name].iloc[-1])
+                
+                data.append({
+                    "Ticker": ticker, "Durum": "COIN", "Miktar": amount_per_coin/price,
+                    "Son_Islem_Fiyati": price, "Nakit_Bakiye_USD": 0.0, "Baslangic_USD": float(amount_per_coin),
+                    "Kaydedilen_Deger_USD": float(amount_per_coin), "Son_Islem_Log": "Başlangıç", "Son_Islem_Zamani": get_current_time_str()
+                })
+        except:
+            pass
         progress.progress((i+1)/len(tickers))
+    
     df = pd.DataFrame(data)
     save_to_google_sheets(df)
     return df
@@ -109,6 +119,8 @@ def run_tournament_logic_cached(ticker):
     try:
         df_raw = yf.download(ticker, start=START_DATE, progress=False)
         if df_raw.empty or len(df_raw) < 730: return "VERI_YOK", 0.0
+        
+        # MultiIndex Düzeltme
         if isinstance(df_raw.columns, pd.MultiIndex): df_raw.columns = df_raw.columns.get_level_values(0)
         df_raw.columns = [c.lower() for c in df_raw.columns]
         if 'close' not in df_raw.columns and 'adj close' in df_raw.columns: df_raw['close'] = df_raw['adj close']
@@ -197,12 +209,26 @@ if pf_df.empty: st.warning("Veri yok."); st.stop()
 cur_val = 0; saved_val = 0; invested = pf_df['Baslangic_USD'].sum()
 if 'Kaydedilen_Deger_USD' in pf_df.columns: saved_val = pf_df['Kaydedilen_Deger_USD'].sum()
 
-# Canlı Fiyat Çek (Hızlı Gösterim İçin)
+# Canlı Fiyat Çek (Hızlı Gösterim İçin) - DÜZELTİLEN KISIM
 live_prices = {}
 for t in pf_df['Ticker']:
-    d = yf.download(t, period="1d", progress=False)
-    if not d.empty: live_prices[t] = float(d['Close'].iloc[-1])
-    else: live_prices[t] = 0
+    try:
+        d = yf.download(t, period="1d", progress=False)
+        if not d.empty: 
+            # MultiIndex Kontrolü
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+            
+            # Column name case sensitivity handle
+            col_name = 'Close' if 'Close' in d.columns else 'close'
+            
+            # Sadece değeri al (scalar)
+            val = d[col_name].iloc[-1]
+            live_prices[t] = float(val)
+        else: 
+            live_prices[t] = 0.0
+    except:
+        live_prices[t] = 0.0
 
 display_data = []
 for _, row in pf_df.iterrows():
