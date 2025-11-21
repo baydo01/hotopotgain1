@@ -15,3 +15,15 @@ pandas
 numpy
 gspread
 oauth2client
+
+streamlit
+yfinance
+pandas
+numpy
+hmmlearn
+scikit-learn
+xgboost
+plotly
+gspread
+google-auth
+deap
