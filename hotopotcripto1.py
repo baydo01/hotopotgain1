@@ -1,29 +1,6 @@
-# trader_bot_full_engine_v3.py
-# Hedge Fund AI — BEAST MODE v3
-# v2 engine + meta-learner augmentation with PCA, ARIMA, ARCH, Earth
-# ---------------------------
-# Gerekli paketler (requirements.txt için):
-"""
-streamlit
-yfinance
-pandas
-numpy
-plotly
-gspread
-oauth2client
-hmmlearn
-scikit-learn
-xgboost
-lightgbm
-pyearth
-statsmodels
-arch
-deap
-optuna
-numba
-openpyxl
-"""
-# ---------------------------
+# trader_bot_full_engine_v4.py
+# Hedge Fund AI — BEAST MODE v4
+# v3 engine + meta-learner augmentation with PCA, ARIMA, ARCH, GBM (Earth removed)
 
 import streamlit as st
 import yfinance as yf
@@ -38,13 +15,12 @@ from typing import Dict, Any, Optional, List, Tuple
 
 # ML models
 from hmmlearn.hmm import GaussianHMM
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
 import lightgbm as lgb
 from sklearn.decomposition import PCA
-from pyearth import Earth
 from statsmodels.tsa.arima.model import ARIMA
 from arch import arch_model
 
@@ -71,16 +47,16 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # CONFIG / GLOBALS / LOGGER
 # ---------------------------
-st.set_page_config(page_title="Hedge Fund AI: BEAST MODE v3", layout="wide")
-st.title("🦍 Hedge Fund AI v3 (Meta Learner + ARIMA/ARCH/Earth)")
+st.set_page_config(page_title="Hedge Fund AI: BEAST MODE v4", layout="wide")
+st.title("🦍 Hedge Fund AI v4 (Meta Learner + ARIMA/ARCH/GBM)")
 
-CACHE_DIR = "cache_yf_v3"
-MODEL_DIR = "models_v3"
+CACHE_DIR = "cache_yf_v4"
+MODEL_DIR = "models_v4"
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("beast_v3")
+logger = logging.getLogger("beast_v4")
 
 SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
 CREDENTIALS_FILE = "service_account.json"
@@ -90,7 +66,7 @@ DEFAULT_TARGET_COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "
 # STREAMLIT SIDEBAR CONFIG
 # ---------------------------
 with st.sidebar:
-    st.header("⚙️ Canavar Ayarları v3")
+    st.header("⚙️ Canavar Ayarları v4")
     use_optuna = st.checkbox("Optuna (Bayesian) kullan (GA yerine)", value=False)
     max_gens = st.number_input("GA Jenerasyon (Evrim Sayısı)", 1, 200, 8)
     pop_size = st.number_input("Popülasyon Büyüklüğü", 4, 200, 24)
@@ -120,14 +96,14 @@ def connect_sheet():
     try:
         client = gspread.authorize(creds)
         return client.open_by_key(SHEET_ID).sheet1
-    except Exception as e:
-        logger.exception("Failed to connect to Google Sheets")
+    except Exception:
         return None
 
 def load_and_fix_portfolio(target_coins=DEFAULT_TARGET_COINS):
     sheet = connect_sheet()
     if sheet is None:
-        df = pd.DataFrame([{"Ticker": t,"Durum":"CASH","Miktar":0.0,"Son_Islem_Fiyati":0.0,"Nakit_Bakiye_USD":10.0,"Baslangic_USD":10.0,"Kaydedilen_Deger_USD":10.0,"Son_Islem_Log":"LOCAL","Son_Islem_Zamani":"-"} for t in target_coins])
+        df = pd.DataFrame([{"Ticker": t,"Durum":"CASH","Miktar":0.0,"Son_Islem_Fiyati":0.0,"Nakit_Bakiye_USD":10.0,
+                            "Baslangic_USD":10.0,"Kaydedilen_Deger_USD":10.0,"Son_Islem_Log":"LOCAL","Son_Islem_Zamani":"-"} for t in target_coins])
         return df, None
     try:
         data = sheet.get_all_records()
@@ -140,22 +116,14 @@ def load_and_fix_portfolio(target_coins=DEFAULT_TARGET_COINS):
     except Exception:
         return pd.DataFrame(), sheet
 
-def save_portfolio(df, sheet=None, excel_path="portfolio_output.xlsx"):
-    # Google Sheets kaydı
-    if sheet is not None:
-        try:
-            df_export = df.astype(str)
-            sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
-            logger.info("Portfolio saved to Google Sheet.")
-        except Exception:
-            logger.exception("Failed to save portfolio to Google Sheet")
-    
-    # Lokal Excel kaydı
+def save_portfolio(df, sheet):
+    if sheet is None: return
     try:
-        df.to_excel(excel_path, index=False)
-        logger.info(f"Portfolio saved locally as {excel_path}")
+        df_export = df.astype(str)
+        sheet.update([df_export.columns.values.tolist()] + df_export.values.tolist())
+        logger.info("Portfolio saved to sheet.")
     except Exception:
-        logger.exception("Failed to save portfolio locally")
+        logger.exception("Failed to save portfolio to sheet")
 
 # ---------------------------
 # CACHING / DATA LOADING
@@ -274,47 +242,49 @@ def process_data(df:pd.DataFrame, timeframe:str='D')->Optional[pd.DataFrame]:
     return df_res
 
 # ---------------------------
-# META LEARNER TRAIN (PCA, ARIMA, ARCH, Earth)
+# META LEARNER TRAIN (PCA, ARIMA, ARCH, GBM)
 # ---------------------------
 def train_meta_learner(df, params=None):
     rf_depth = params.get('rf_depth',5) if params else 5
     rf_est = params.get('rf_est',50) if params else 50
     X_cols = ['log_ret','range','heuristic','momentum']
     y = df['target']
+    
     # Base models
     rf = RandomForestClassifier(n_estimators=rf_est,max_depth=rf_depth,n_jobs=-1,random_state=seed).fit(df[X_cols],y)
     xgb_c = xgb.XGBClassifier(n_estimators=50,max_depth=rf_depth,learning_rate=0.05,verbosity=0,use_label_encoder=False,eval_metric='logloss').fit(df[X_cols],y)
     lgb_c = lgb.LGBMClassifier(n_estimators=50,learning_rate=0.05,verbose=-1).fit(df[X_cols],y)
+    # GBM alternative for Earth
+    gbm_c = GradientBoostingClassifier(n_estimators=50,max_depth=rf_depth,learning_rate=0.05).fit(df[X_cols],y)
+    
     # PCA feature
     pca = PCA(n_components=2)
     pca_features = pca.fit_transform(df[X_cols])
+    
     # ARIMA + ARCH on log_ret
     arima_pred = df['log_ret'].rolling(5).mean().fillna(0).values
     arch_pred = df['log_ret'].rolling(5).std().fillna(0).values
-    # Earth model on heuristic/momentum
-    earth_model = Earth(max_degree=2)
-    earth_model.fit(df[['heuristic','momentum']],y)
-    earth_pred = earth_model.predict(df[['heuristic','momentum']])
+    
     # Combine meta features
     meta_features = pd.DataFrame({
         'RF': rf.predict_proba(df[X_cols])[:,1],
         'XGB': xgb_c.predict_proba(df[X_cols])[:,1],
         'LGBM': lgb_c.predict_proba(df[X_cols])[:,1],
+        'GBM': gbm_c.predict_proba(df[X_cols])[:,1],
         'PCA1': pca_features[:,0],
         'PCA2': pca_features[:,1],
         'ARIMA': arima_pred,
         'ARCH': arch_pred,
-        'Earth': earth_pred,
         'Heuristic': df['heuristic'],
         'Momentum': df['momentum']
     })
     meta_model = LogisticRegression(max_iter=200).fit(meta_features,y)
-    return meta_model, {'RF':rf,'XGB':xgb_c,'LGBM':lgb_c,'PCA':pca,'Earth':earth_model}
+    return meta_model, {'RF':rf,'XGB':xgb_c,'LGBM':lgb_c,'GBM':gbm_c,'PCA':pca}
 
 # ---------------------------
-# Streamlit UI
+# STREAMLIT RUN
 # ---------------------------
-if st.button("🦍 CANAVAR MODU v3 BAŞLAT"):
+if st.button("🦍 CANAVAR MODU v4 BAŞLAT"):
     pf_df, sheet = load_and_fix_portfolio()
     if pf_df.empty: st.error("Portföy hatası")
     else:
@@ -331,5 +301,4 @@ if st.button("🦍 CANAVAR MODU v3 BAŞLAT"):
                     ticker, ph, use_optuna_flag=use_optuna, n_gen=max_gens, pop_size=pop_size, tx_cost_pct=tx_cost_perc, parallel=use_parallel
                 )
                 prog.progress((i+1)/len(updated))
-        save_portfolio(updated, sheet, excel_path="portfolio_output.xlsx")
-        st.success("Portföy kaydedildi ✅ (Google Sheets ve lokal Excel)")
+        save_portfolio(updated, sheet)
