@@ -7,3 +7,11 @@ seaborn
 hmmlearn
 scikit-learn
 ccxt
+streamlit
+yfinance
+hmmlearn
+scikit-learn
+pandas
+numpy
+gspread
+oauth2client
