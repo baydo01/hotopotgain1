@@ -112,16 +112,6 @@ def calculate_heuristic_score(df):
     momentum = np.sign(df['close'].diff(20).fillna(0))
     return (s1 + s2 + s3 + s4 + s5 + momentum) / 6.0
 
-def calc_momentum_features(df, window=5):
-    """
-    Son 'window' birim fiyat değişimlerini yüzdelik olarak hesaplar.
-    """
-    df_feat = pd.DataFrame(index=df.index)
-    for i in range(1, window+1):
-        df_feat[f"pct_change_{i}"] = df['close'].pct_change(i).fillna(0)
-    df_feat['momentum_score'] = df_feat.sum(axis=1) / window
-    return df_feat
-
 def get_raw_data(ticker):
     try:
         df = yf.download(ticker, period="2y", interval="1d", progress=False)
@@ -143,9 +133,21 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
+    
+    # --- Senin Kuralın Fonksiyonu ---
+    def your_rule(series):
+        score = 0
+        if series[-5:].mean() < series[-10:-5].mean(): score -= 1  # son 5 birim azalmış
+        else: score += 1
+        if series[-52*3:].mean() < series[-52*3-50:-52*3].mean(): score -= 1  # son 3 yıl azalmış (yaklaşık 3*52 hafta)
+        else: score +=1
+        if series[-5*7:].mean() < series[-10*7:-5*7].mean(): score -=1  # son 5 hafta azalmış
+        else: score +=1
+        return 1 if score>=0 else -1
+    
+    df_res['your_rule'] = df_res['close'].rolling(200, min_periods=10).apply(your_rule, raw=False).fillna(0)
+    
     df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
-    momentum_feats = calc_momentum_features(df_res)
-    df_res = pd.concat([df_res, momentum_feats], axis=1)
     df_res.dropna(inplace=True)
     return df_res
 
@@ -166,13 +168,9 @@ def train_meta_learner(df, params=None):
     test_size = 60
     if len(df) < test_size + 50: return 0.0, None
     train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
-    
-    # Features
-    X_tr = train[['log_ret', 'range', 'heuristic', 'momentum_score']]; y_tr = train['target']
+    X_tr = train[['log_ret', 'range', 'heuristic', 'your_rule']]; y_tr = train['target']
     rf = RandomForestClassifier(n_estimators=rf_n, max_depth=rf_d, random_state=42).fit(X_tr, y_tr)
     xgb_c = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3).fit(X_tr, y_tr)
-    
-    # HMM
     scaler = StandardScaler()
     X_hmm = scaler.fit_transform(train[['log_ret', 'range']])
     hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50, random_state=42)
@@ -184,30 +182,24 @@ def train_meta_learner(df, params=None):
         bull = np.argmax(hmm.means_[:,0]); bear = np.argmin(hmm.means_[:,0])
         hmm_pred = pr[:, bull] - pr[:, bear]
     
-    # Logistic Regression meta model
-    meta_X = pd.DataFrame({
-        'RF': rf.predict_proba(X_tr)[:,1],
-        'XGB': xgb_c.predict_proba(X_tr)[:,1],
-        'HMM': hmm_pred,
-        'Heuristic': train['heuristic'].values,
-        'Momentum': train['momentum_score'].values
-    })
+    # --- Logistic Regression Model (Senin Kuralın dahil) ---
+    meta_X = pd.DataFrame({'RF': rf.predict_proba(X_tr)[:,1],
+                           'XGB': xgb_c.predict_proba(X_tr)[:,1],
+                           'HMM': hmm_pred,
+                           'Heuristic': train['heuristic'].values,
+                           'YourRule': train['your_rule'].values})
     meta_model = LogisticRegression().fit(meta_X, y_tr)
+    weights = meta_model.coef_[0]
     
-    # Simülasyon
     sim_eq=[100]; hodl_eq=[100]; cash=100; coin=0; p0=test['close'].iloc[0]
     X_hmm_t = scaler.transform(test[['log_ret','range']])
     hmm_p_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
     hmm_s_t = hmm_p_t[:, np.argmax(hmm.means_[:,0])] - hmm_p_t[:, np.argmin(hmm.means_[:,0])] if hmm else np.zeros(len(test))
-    
-    mx_test = pd.DataFrame({
-        'RF': rf.predict_proba(test[['log_ret','range','heuristic','momentum_score']])[:,1],
-        'XGB': xgb_c.predict_proba(test[['log_ret','range','heuristic','momentum_score']])[:,1],
-        'HMM': hmm_s_t,
-        'Heuristic': test['heuristic'].values,
-        'Momentum': test['momentum_score'].values
-    })
-    
+    mx_test = pd.DataFrame({'RF': rf.predict_proba(test[['log_ret','range','heuristic','your_rule']])[:,1],
+                            'XGB': xgb_c.predict_proba(test[['log_ret','range','heuristic','your_rule']])[:,1],
+                            'HMM': hmm_s_t,
+                            'Heuristic': test['heuristic'].values,
+                            'YourRule': test['your_rule'].values})
     probs = meta_model.predict_proba(mx_test)[:,1]
     
     for i in range(len(test)):
@@ -215,20 +207,8 @@ def train_meta_learner(df, params=None):
         if s>0.25 and cash>0: coin=cash/p; cash=0
         elif s<-0.25 and coin>0: cash=coin*p; coin=0
         sim_eq.append(cash+coin*p); hodl_eq.append((100/p0)*p)
-    
     final_signal=(probs[-1]-0.5)*2
-    info={
-        'weights': meta_model.coef_[0],
-        'bot_eq': sim_eq[1:],
-        'hodl_eq': hodl_eq[1:],
-        'dates': test.index,
-        'alpha': (sim_eq[-1]-hodl_eq[-1]),
-        'bot_roi': (sim_eq[-1]-100),
-        'hodl_roi': (hodl_eq[-1]-100),
-        'conf': probs[-1],
-        'my_score': test['heuristic'].iloc[-1],
-        'lr_signal': probs[-1]
-    }
+    info={'weights': weights,'bot_eq': sim_eq[1:],'hodl_eq': hodl_eq[1:],'dates': test.index,'alpha': (sim_eq[-1]-hodl_eq[-1]),'bot_roi': (sim_eq[-1]-100),'hodl_roi': (hodl_eq[-1]-100),'conf': probs[-1],'my_score': test['heuristic'].iloc[-1]}
     return final_signal, info
 
 # =============================================================================
@@ -275,14 +255,12 @@ if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
                 ph = st.empty()
                 dec, prc, tf, info = analyze_ticker_tournament(ticker, ph)
                 if dec!="HATA" and info:
-                    sim_summary.append({"Coin":ticker,"Kazanan TF":tf,"Bot ROI":info['bot_roi'],"HODL ROI":info['hodl_roi'],"Alpha":info['alpha'],"LR Puanı":info['lr_signal']})
+                    sim_summary.append({"Coin":ticker,"Kazanan TF":tf,"Bot ROI":info['bot_roi'],"HODL ROI":info['hodl_roi'],"Alpha":info['alpha']})
                     w=info['weights']; w_abs=np.abs(w); w_norm=w_abs/(np.sum(w_abs)+1e-9)*100
                     c1,c2=st.columns([1,2])
                     with c1:
-                        st.markdown(f"### Karar: **{dec}**"); st.caption(f"Seçilen Zaman Dilimi: {tf}")
-                        st.markdown(f"**Senin Puanın:** {info['my_score']:.2f}"); st.markdown(f"**LR Puanı:** {info['lr_signal']:.2f}")
-                        st.markdown("**Model Etki Dağılımı:**")
-                        w_df=pd.DataFrame({'Faktör':['RandomForest','XGBoost','HMM','Senin Kuralın','Momentum LR'],'Etki (%)':w_norm})
+                        st.markdown(f"### Karar: **{dec}**"); st.caption(f"Seçilen Zaman Dilimi: {tf}"); st.markdown(f"**Senin Puanın:** {info['my_score']:.2f}"); st.markdown(f"**LR Puanı:** {info['conf']:.2f}"); st.markdown("**Model Etki Dağılımı:**")
+                        w_df=pd.DataFrame({'Faktör':['RandomForest','XGBoost','HMM','Senin Kuralın','Heuristic'],'Etki (%)':w_norm})
                         st.dataframe(w_df, hide_index=True)
                     with c2:
                         fig=go.Figure(); fig.add_trace(go.Scatter(x=info['dates'],y=info['bot_eq'],name="Bot",line=dict(color='green',width=2)))
@@ -293,19 +271,17 @@ if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
                     stt=row['Durum']
                     if stt=='COIN' and dec=='SAT':
                         amt=float(row['Miktar'])
-                        if amt>0: updated.at[idx,'Durum']='CASH'; updated.at[idx,'Nakit_Bakiye_USD']=amt*prc; updated.at[idx,'Miktar']=0.0; updated.at[idx,'Son_Islem_Fiyati']=prc; updated.at[idx,'Son_Islem_Log']=f"SAT ({tf}) A:{info['alpha']:.1f}"; updated.at[idx,'Son_Islem_Zamani']=time_str
+                        if amt>0: updated.at[idx,'Durum']='CASH'; updated.at[idx,'Nakit_Bakiye_USD']=amt*prc; updated.at[idx,'Miktar']=0.0; updated.at[idx,'Son_Islem_Fiyati']=prc; updated.at[idx,'Son_Islem_Log']=f"SAT ({tf}) A:{info['alpha']:.2f} {time_str}"; updated.at[idx,'Son_Islem_Zamani']=time_str
                     elif stt=='CASH' and dec=='AL':
                         cash=float(row['Nakit_Bakiye_USD'])
-                        if cash>1: updated.at[idx,'Durum']='COIN'; updated.at[idx,'Miktar']=cash/prc; updated.at[idx,'Nakit_Bakiye_USD']=0.0; updated.at[idx,'Son_Islem_Fiyati']=prc; updated.at[idx,'Son_Islem_Log']=f"AL ({tf}) A:{info['alpha']:.1f}"; updated.at[idx,'Son_Islem_Zamani']=time_str
-                    val=(float(updated.at[idx,'Miktar'])*prc) if updated.at[idx,'Durum']=='COIN' else float(updated.at[idx,'Nakit_Bakiye_USD'])
-                    updated.at[idx,'Kaydedilen_Deger_USD']=val
-                    ph.success(f"Analiz Bitti. En iyi grafik: {tf}")
+                        if cash>0: updated.at[idx,'Durum']='COIN'; updated.at[idx,'Miktar']=cash/prc; updated.at[idx,'Nakit_Bakiye_USD']=0.0; updated.at[idx,'Son_Islem_Fiyati']=prc; updated.at[idx,'Son_Islem_Log']=f"AL ({tf}) A:{info['alpha']:.2f} {time_str}"; updated.at[idx,'Son_Islem_Zamani']=time_str
             prog.progress((i+1)/len(updated))
         save_portfolio(updated, sheet)
-        st.divider(); st.subheader("🏆 Turnuva Sonuçları & Performans")
         if sim_summary:
-            sum_df=pd.DataFrame(sim_summary)
-            col1,col2,col3=st.columns(3)
-            col1.metric("Ort. Bot Getirisi", f"%{sum_df['Bot ROI'].mean():.2f}"); col2.metric("Ort. HODL Getirisi", f"%{sum_df['HODL ROI'].mean():.2f}"); col3.metric("TOPLAM ALPHA", f"%{sum_df['Alpha'].mean():.2f}", delta_color="normal")
-            st.dataframe(sum_df.style.format("{:.2f}", subset=["Bot ROI","HODL ROI","Alpha","LR Puanı"]))
+            st.header("🏆 Turnuva Sonuçları & Performans")
+            summary_df=pd.DataFrame(sim_summary)
+            st.dataframe(summary_df, hide_index=True)
+            st.markdown(f"Ort. Bot Getirisi\n\n%-{summary_df['Bot ROI'].mean():.2f}")
+            st.markdown(f"Ort. HODL Getirisi\n\n%-{summary_df['HODL ROI'].mean():.2f}")
+            st.markdown(f"TOPLAM ALPHA\n\n%{summary_df['Alpha'].sum():.2f}")
         st.success("✅ Canavar Motor Tamamlandı!")
