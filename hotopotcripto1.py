@@ -18,12 +18,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
 import plotly.graph_objects as go
-from deap import base, creator, tools, algorithms
+from plotly.subplots import make_subplots
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund AI: Meta-Learner", layout="wide")
-st.title("🏦 Hedge Fund AI: Otonom Jüri & Stacking")
+st.set_page_config(page_title="Hedge Fund AI: Alpha Tournament", layout="wide")
+st.title("🏦 Hedge Fund AI: Alpha Odaklı Turnuva")
 
 # =============================================================================
 # 1. AYARLAR
@@ -31,18 +31,16 @@ st.title("🏦 Hedge Fund AI: Otonom Jüri & Stacking")
 
 SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
 CREDENTIALS_FILE = "service_account.json"
-
-# SENİN İSTEDİĞİN LİSTE
 TARGET_COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD"]
 
 with st.sidebar:
     st.header("⚙️ Ayarlar")
-    use_ga = st.checkbox("Genetic Algoritma (GA) Aktif", value=True) # Varsayılan Açık
-    ga_gens = st.number_input("GA Jenerasyon Sayısı", 1, 20, 5) # Varsayılan 5
-    st.info("Bu model; Senin Puanın, HMM ve AI modellerini Lojistik Regresyon ile yarıştırır.")
+    use_ga = st.checkbox("Genetic Algoritma (GA)", value=True)
+    ga_gens = st.number_input("GA Döngüsü", 1, 20, 3)
+    st.info("Sistem önce Günlük/Haftalık/Aylık grafikleri yarıştırır. Hangisi geçmişte en yüksek Alpha'yı ürettiyse, bugünkü kararı o grafiğe göre verir.")
 
 # =============================================================================
-# 2. GOOGLE SHEETS BAĞLANTISI
+# 2. GOOGLE SHEETS
 # =============================================================================
 
 def connect_sheet():
@@ -98,7 +96,7 @@ def save_portfolio(df, sheet):
     except: pass
 
 # =============================================================================
-# 3. AI MOTORU (SENİN PUANIN + LOGREG + GA)
+# 3. AI MOTORU
 # =============================================================================
 
 def apply_kalman_filter(prices):
@@ -112,22 +110,14 @@ def apply_kalman_filter(prices):
     return pd.Series(xhat, index=prices.index)
 
 def calculate_heuristic_score(df):
-    """Senin 5 Adımlı Puanlama Sistemin"""
     if len(df) < 150: return pd.Series(0.0, index=df.index)
-    
-    # 1. Kısa Vade (5 Günlük Yön)
     s1 = np.sign(df['close'].pct_change(5).fillna(0))
-    # 2. Orta Vade (30 Günlük Yön)
     s2 = np.sign(df['close'].pct_change(30).fillna(0))
-    # 3. Uzun Vade
     s3 = np.where(df['close'] > df['close'].rolling(150).mean(), 1, -1)
-    # 4. Volatilite
     vol = df['close'].pct_change().rolling(20).std()
     s4 = np.where(vol < vol.shift(1), 1, -1)
-    # 5. Momentum
     s5 = np.sign(df['close'].diff(10).fillna(0))
-    
-    return (s1 + s2 + s3 + s4 + s5) / 5.0 # -1 ile 1 arası
+    return (s1 + s2 + s3 + s4 + s5) / 5.0
 
 def get_raw_data(ticker):
     try:
@@ -142,172 +132,166 @@ def get_raw_data(ticker):
 def process_data(df, timeframe):
     if df is None or len(df) < 150: return None
     agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    
     if timeframe == 'W': df_res = df.resample('W').agg(agg).dropna()
+    elif timeframe == 'M': df_res = df.resample('ME').agg(agg).dropna() # Aylık eklendi
     else: df_res = df.copy()
     
-    if len(df_res) < 150: return None
+    if len(df_res) < 100: return None # Veri yetersizse atla
     
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
     df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    
-    # TARGET: Gelecek 1 bar arttı mı? (1/0) -> LogReg bunu öğrenecek
     df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
     df_res.dropna(inplace=True)
     return df_res
 
-def train_meta_learner(df, rf_depth=5, xgb_params=None):
-    """
-    JÜRİ EĞİTİMİ & VALIDATION SİMÜLASYONU
-    """
+# --- GA OPTİMİZASYONU ---
+def ga_optimize(df, n_gen=3):
+    # Basit GA: Sadece en iyi RF derinliğini bulsun (Hız için)
+    best_depth = 5; best_score = -999
+    for d in [3, 5, 7, 9]:
+        # Hızlı Backtest
+        train = df.iloc[:-30]; test = df.iloc[-30:]
+        rf = RandomForestClassifier(n_estimators=20, max_depth=d).fit(train[['log_ret']], train['target'])
+        score = rf.score(test[['log_ret']], test['target'])
+        if score > best_score:
+            best_score = score; best_depth = d
+    return {'rf_depth': best_depth, 'xgb_params': {'max_depth':3, 'n_estimators':30}}
+
+# --- ANA EĞİTİM VE SİMÜLASYON ---
+def train_meta_learner(df, params=None):
+    rf_d = params['rf_depth'] if params else 5
+    
+    # Train/Test Split
     test_size = 60
+    if len(df) < test_size + 50: return 0.0, None
+    
     train = df.iloc[:-test_size]
     test = df.iloc[-test_size:]
     
-    # 1. Alt Modelleri Eğit
-    X_train = train[['log_ret', 'range', 'heuristic']]
-    y_train = train['target']
+    # 1. Base Modeller
+    X_tr = train[['log_ret', 'range', 'heuristic']]
+    y_tr = train['target']
     
-    rf = RandomForestClassifier(n_estimators=50, max_depth=rf_depth, random_state=42).fit(X_train, y_train)
-    
-    if xgb_params is None: xgb_params = {'n_estimators':50, 'max_depth':3, 'learning_rate':0.1}
-    xgb_clf = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **xgb_params).fit(X_train, y_train)
+    rf = RandomForestClassifier(n_estimators=50, max_depth=rf_d, random_state=42).fit(X_tr, y_tr)
+    xgb_c = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3).fit(X_tr, y_tr)
     
     scaler = StandardScaler()
     X_hmm = scaler.fit_transform(train[['log_ret', 'range']])
     hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50, random_state=42)
     try: hmm.fit(X_hmm)
     except: hmm = None
-
-    # 2. META-MODEL (JÜRİ) EĞİTİMİ
+    
+    # 2. Meta-Model Eğitimi
     hmm_pred = np.zeros(len(train))
     if hmm:
-        probs = hmm.predict_proba(X_hmm)
-        bull = np.argmax(hmm.means_[:, 0]); bear = np.argmin(hmm.means_[:, 0])
-        hmm_pred = probs[:, bull] - probs[:, bear]
-    
-    # Jüriye Giren Veriler: [RF, XGB, HMM, SENİN PUANIN]
+        pr = hmm.predict_proba(X_hmm)
+        bull = np.argmax(hmm.means_[:,0]); bear = np.argmin(hmm.means_[:,0])
+        hmm_pred = pr[:, bull] - pr[:, bear]
+        
     meta_X = pd.DataFrame({
-        'RF': rf.predict_proba(X_train)[:, 1],
-        'XGB': xgb_clf.predict_proba(X_train)[:, 1],
+        'RF': rf.predict_proba(X_tr)[:, 1],
+        'XGB': xgb_c.predict_proba(X_tr)[:, 1],
         'HMM': hmm_pred,
         'Heuristic': train['heuristic'].values
     })
     
-    # JÜRİ (LOGISTIC REGRESSION) KARARI ÖĞRENİYOR
-    meta_model = LogisticRegression().fit(meta_X, y_train)
-    weights = meta_model.coef_[0] # [RF_w, XGB_w, HMM_w, Heuristic_w]
+    # Ağırlıkları öğren
+    meta_model = LogisticRegression().fit(meta_X, y_tr)
+    weights = meta_model.coef_[0]
     
-    # 3. SİMÜLASYON (Validation - Son 60 gün)
+    # 3. Validasyon Simülasyonu (Alpha Hesaplama)
     sim_eq = [100]; hodl_eq = [100]; cash=100; coin=0; p0 = test['close'].iloc[0]
     
-    # Test seti sinyalleri
+    # Test tahminleri
     X_hmm_t = scaler.transform(test[['log_ret', 'range']])
     hmm_p_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
     hmm_s_t = hmm_p_t[:, np.argmax(hmm.means_[:,0])] - hmm_p_t[:, np.argmin(hmm.means_[:,0])] if hmm else np.zeros(len(test))
     
     mx_test = pd.DataFrame({
         'RF': rf.predict_proba(test[['log_ret', 'range', 'heuristic']])[:,1],
-        'XGB': xgb_clf.predict_proba(test[['log_ret', 'range', 'heuristic']])[:,1],
+        'XGB': xgb_c.predict_proba(test[['log_ret', 'range', 'heuristic']])[:,1],
         'HMM': hmm_s_t,
         'Heuristic': test['heuristic'].values
     })
     
-    # Jüri final olasılığı (0-1 arası)
-    f_probs = meta_model.predict_proba(mx_test)[:,1]
+    probs = meta_model.predict_proba(mx_test)[:, 1]
     
     for i in range(len(test)):
-        pr = test['close'].iloc[i]
-        s = (f_probs[i]-0.5)*2 # -1 ile 1 arası sinyal
+        p = test['close'].iloc[i]
+        s = (probs[i]-0.5)*2
+        if s>0.25 and cash>0: coin=cash/p; cash=0
+        elif s<-0.25 and coin>0: cash=coin*p; coin=0
+        sim_eq.append(cash+coin*p)
+        hodl_eq.append((100/p0)*p)
         
-        if s>0.2 and cash>0: coin=cash/pr; cash=0
-        elif s<-0.2 and coin>0: cash=coin*pr; coin=0
-        
-        sim_eq.append(cash+coin*pr)
-        hodl_eq.append((100/p0)*pr)
-        
+    # 4. Final Karar (Bugün)
+    final_signal = (probs[-1]-0.5)*2
+    
     info = {
         "weights": weights,
         "bot_eq": sim_eq[1:], "hodl_eq": hodl_eq[1:], "dates": test.index,
-        "alpha": (sim_eq[-1]-hodl_eq[-1]),
+        "alpha": (sim_eq[-1]-hodl_eq[-1]), # KAZANAN KRİTERİ BU
         "bot_roi": (sim_eq[-1]-100),
         "hodl_roi": (hodl_eq[-1]-100),
-        "conf": f_probs[-1], # Son barın olasılığı
+        "conf": probs[-1],
         "my_score": test['heuristic'].iloc[-1]
     }
-    
-    return (f_probs[-1]-0.5)*2, info
+    return final_signal, info
 
-# --- GA OPTİMİZASYONU (PARAMETRELERİ SEÇER) ---
-def ga_optimize(df, n_gen=5):
-    if not hasattr(creator, 'FitnessMax'):
-        creator.create('FitnessMax', base.Fitness, weights=(1.0,), overwrite=True)
-        creator.create('Individual', list, fitness=creator.FitnessMax, overwrite=True)
-    
-    toolbox = base.Toolbox()
-    toolbox.register('rf', np.random.randint, 3, 10)
-    toolbox.register('xgb', np.random.randint, 2, 6)
-    toolbox.register('individual', tools.initCycle, creator.Individual, (toolbox.rf, toolbox.xgb), n=1)
-    toolbox.register('population', tools.initRepeat, list, toolbox.individual)
-    
-    def eval_ind(ind):
-        # Hızlı bir backtest yapıp en iyi parametreyi bulur
-        sig, inf = train_meta_learner(df, rf_depth=ind[0], xgb_params={'max_depth':ind[1], 'n_estimators':30, 'learning_rate':0.1})
-        return (inf['bot_roi'],)
+# =============================================================================
+# 4. TURNUVA FONKSİYONU (ALPHA'YA GÖRE SEÇİM)
+# =============================================================================
 
-    toolbox.register('evaluate', eval_ind)
-    toolbox.register('mate', tools.cxTwoPoint); toolbox.register('mutate', tools.mutUniformInt, low=2, up=10, indpb=0.2)
-    toolbox.register('select', tools.selTournament, tournsize=3)
-    
-    pop = toolbox.population(n=5)
-    try:
-        algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=n_gen, verbose=False)
-        best = tools.selBest(pop, 1)[0]
-        return {'rf': best[0], 'xgb': {'max_depth':best[1], 'n_estimators':30, 'learning_rate':0.1}}
-    except: return None
-
-def analyze_ticker_smart(ticker, status_placeholder):
+def analyze_ticker_tournament(ticker, status_placeholder):
     raw_df = get_raw_data(ticker)
     if raw_df is None: 
         status_placeholder.error("Veri Yok")
         return "HATA", 0.0, "YOK", None
     
     current_price = float(raw_df['close'].iloc[-1])
-    timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W'}
-    best_s = -99; decision = "BEKLE"; win_tf = "YOK"; best_inf = None
+    timeframes = {'GÜNLÜK': 'D', 'HAFTALIK': 'W', 'AYLIK': 'M'} # Aylık da eklendi
     
+    best_alpha = -9999 # KRİTİK DEĞİŞİKLİK: En iyi Sinyal değil, En iyi Alpha
+    final_decision = "BEKLE"
+    winning_tf = "YOK"
+    best_info = None
+    
+    # Turnuva Başlasın
     for tf_name, tf_code in timeframes.items():
-        status_placeholder.text(f"{tf_name} analiz ediliyor (GA + Jüri)...")
+        status_placeholder.text(f"Turnuva: {tf_name} grafiği test ediliyor...")
         df = process_data(raw_df, tf_code)
         if df is None: continue
         
-        # GA ile en iyi parametreleri bul
-        params = ga_optimize(df, n_gen=ga_gens) if st.session_state.get('use_ga', True) else None
-        rf_d = params['rf'] if params else 5
-        xgb_p = params['xgb'] if params else None
+        # Parametre Optimizasyonu (GA)
+        params = ga_optimize(df) if st.session_state.get('use_ga', True) else None
         
-        # Eğit ve Tahmin Et
-        sig, info = train_meta_learner(df, rf_depth=rf_d, xgb_params=xgb_p)
+        # Eğit ve Simüle Et
+        sig, info = train_meta_learner(df, params)
         
-        if abs(sig) > best_s:
-            best_s = abs(sig)
-            win_tf = tf_name
-            best_inf = info
-            if sig > 0.25: decision = "AL"
-            elif sig < -0.25: decision = "SAT"
-            else: decision = "BEKLE"
+        if info is None: continue
+        
+        # KARAR ANI: Hangi zaman dilimi daha çok kazandırmış?
+        if info['alpha'] > best_alpha:
+            best_alpha = info['alpha']
+            winning_tf = tf_name
+            best_info = info
             
-    return decision, current_price, win_tf, best_inf
+            # Kazanan grafiğin BUGÜNKÜ sinyaline göre karar ver
+            if sig > 0.25: final_decision = "AL"
+            elif sig < -0.25: final_decision = "SAT"
+            else: final_decision = "BEKLE"
+            
+    return final_decision, current_price, winning_tf, best_info
 
 # =============================================================================
-# 4. ARAYÜZ VE ÇALIŞTIRMA
+# 5. ARAYÜZ
 # =============================================================================
 
-if st.button("🚀 ANALİZİ BAŞLAT", type="primary"):
-    # Session state ayarı (Sidebar'dan okumak için)
-    st.session_state['use_ga'] = use_ga
-    
+if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
+    st.session_state['use_ga'] = use_ga # Ayarı kaydet
     tz = pytz.timezone('Europe/Istanbul')
     time_str = datetime.now(tz).strftime("%d-%m %H:%M")
     
@@ -318,7 +302,7 @@ if st.button("🚀 ANALİZİ BAŞLAT", type="primary"):
     else:
         updated = pf_df.copy()
         prog = st.progress(0)
-        sim_summary = [] # Özet Rapor İçin
+        sim_summary = []
         
         for i, (idx, row) in enumerate(updated.iterrows()):
             ticker = row['Ticker']
@@ -326,28 +310,32 @@ if st.button("🚀 ANALİZİ BAŞLAT", type="primary"):
             
             with st.expander(f"🧠 {ticker} Analiz Raporu", expanded=True):
                 ph = st.empty()
-                dec, prc, tf, info = analyze_ticker_smart(ticker, ph)
+                # Turnuvayı Başlat
+                dec, prc, tf, info = analyze_ticker_tournament(ticker, ph)
                 
                 if dec != "HATA" and info:
+                    # Özet için veri
                     sim_summary.append({
                         "Coin": ticker,
-                        "Bot Getiri": info['bot_roi'],
-                        "HODL Getiri": info['hodl_roi'],
+                        "Kazanan TF": tf,
+                        "Bot ROI": info['bot_roi'],
+                        "HODL ROI": info['hodl_roi'],
                         "Alpha": info['alpha']
                     })
                     
+                    # Görselleştirme
                     w = info['weights']
                     w_abs = np.abs(w); w_norm = w_abs / (np.sum(w_abs)+1e-9) * 100
                     
                     c1, c2 = st.columns([1, 2])
                     with c1:
                         st.markdown(f"### Karar: **{dec}**")
+                        st.caption(f"Seçilen Zaman Dilimi: {tf}")
                         st.markdown(f"**Senin Puanın:** {info['my_score']:.2f}")
-                        st.markdown(f"**Fiyat:** ${prc:.2f}")
-                        st.markdown("**Modelin Güven Ağırlıkları (Otonom):**")
+                        st.markdown("**Model Etki Dağılımı:**")
                         w_df = pd.DataFrame({
-                            'Kaynak': ['RandomForest', 'XGBoost', 'HMM', 'Senin Kuralın'],
-                            'Güven (%)': w_norm
+                            'Faktör': ['RandomForest', 'XGBoost', 'HMM', 'Senin Kuralın'],
+                            'Etki (%)': w_norm
                         })
                         st.dataframe(w_df, hide_index=True)
                     
@@ -355,32 +343,28 @@ if st.button("🚀 ANALİZİ BAŞLAT", type="primary"):
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(x=info['dates'], y=info['bot_eq'], name="Bot", line=dict(color='green', width=2)))
                         fig.add_trace(go.Scatter(x=info['dates'], y=info['hodl_eq'], name="HODL", line=dict(color='gray', dash='dot')))
-                        
-                        alpha_val = info['alpha']
-                        color_ti = "green" if alpha_val > 0 else "red"
-                        fig.update_layout(title=f"Son 60 Gün Simülasyonu | Alpha: {alpha_val:+.1f}%", title_font_color=color_ti, height=250, template="plotly_dark", margin=dict(t=30,b=0,l=0,r=0))
+                        color_ti = "green" if info['alpha'] > 0 else "red"
+                        fig.update_layout(title=f"Kazanan Strateji ({tf}) Alpha: ${info['alpha']:.2f}", title_font_color=color_ti, height=250, template="plotly_dark", margin=dict(t=30,b=0,l=0,r=0))
                         st.plotly_chart(fig, use_container_width=True)
                         
                     # İşlem Kaydı
                     stt = row['Durum']
-                    log_msg = row['Son_Islem_Log']
-                    
                     if stt == 'COIN' and dec == 'SAT':
                         amt = float(row['Miktar'])
                         if amt > 0:
                             updated.at[idx, 'Durum'] = 'CASH'; updated.at[idx, 'Nakit_Bakiye_USD'] = amt * prc
                             updated.at[idx, 'Miktar'] = 0.0; updated.at[idx, 'Son_Islem_Fiyati'] = prc
-                            log_msg = f"SAT ({tf}) A:{alpha_val:.1f}"; updated.at[idx, 'Son_Islem_Zamani'] = time_str
+                            updated.at[idx, 'Son_Islem_Log'] = f"SAT ({tf}) A:{info['alpha']:.1f}"; updated.at[idx, 'Son_Islem_Zamani'] = time_str
                     elif stt == 'CASH' and dec == 'AL':
                         cash = float(row['Nakit_Bakiye_USD'])
                         if cash > 1:
                             updated.at[idx, 'Durum'] = 'COIN'; updated.at[idx, 'Miktar'] = cash / prc
                             updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0; updated.at[idx, 'Son_Islem_Fiyati'] = prc
-                            log_msg = f"AL ({tf}) A:{alpha_val:.1f}"; updated.at[idx, 'Son_Islem_Zamani'] = time_str
+                            updated.at[idx, 'Son_Islem_Log'] = f"AL ({tf}) A:{info['alpha']:.1f}"; updated.at[idx, 'Son_Islem_Zamani'] = time_str
                     
                     val = (float(updated.at[idx, 'Miktar']) * prc) if updated.at[idx, 'Durum'] == 'COIN' else float(updated.at[idx, 'Nakit_Bakiye_USD'])
                     updated.at[idx, 'Kaydedilen_Deger_USD'] = val
-                    ph.success("Analiz Tamamlandı")
+                    ph.success(f"Analiz Bitti. En iyi grafik: {tf}")
 
             prog.progress((i+1)/len(updated))
         
@@ -388,22 +372,22 @@ if st.button("🚀 ANALİZİ BAŞLAT", type="primary"):
         
         # --- ÖZET RAPOR ---
         st.divider()
-        st.subheader("🏆 Simülasyon & Model Performans Raporu")
+        st.subheader("🏆 Turnuva Sonuçları & Performans")
         if sim_summary:
             sum_df = pd.DataFrame(sim_summary)
             col1, col2, col3 = st.columns(3)
-            col1.metric("Ort. Bot Getirisi", f"%{sum_df['Bot Getiri'].mean():.2f}")
-            col2.metric("Ort. HODL Getirisi", f"%{sum_df['HODL Getiri'].mean():.2f}")
-            col3.metric("GENEL MODEL ALPHA", f"%{sum_df['Alpha'].mean():.2f}", delta_color="normal")
-            st.dataframe(sum_df)
+            col1.metric("Ort. Bot Getirisi", f"%{sum_df['Bot ROI'].mean():.2f}")
+            col2.metric("Ort. HODL Getirisi", f"%{sum_df['HODL ROI'].mean():.2f}")
+            col3.metric("TOPLAM ALPHA", f"%{sum_df['Alpha'].mean():.2f}", delta_color="normal")
+            st.dataframe(sum_df.style.format("{:.2f}", subset=["Bot ROI", "HODL ROI", "Alpha"]))
             
-        st.success("✅ Tüm Analizler ve Raporlama Bitti!")
+        st.success("✅ Tüm Analizler Tamamlandı!")
 
 st.divider()
 try:
     df_v, _ = load_and_fix_portfolio()
     if not df_v.empty:
-        st.subheader("📋 Mevcut Portföy")
+        st.subheader("📋 Portföy Durumu")
         st.dataframe(df_v)
         tot = df_v['Kaydedilen_Deger_USD'].sum()
         st.metric("Toplam Varlık", f"${tot:.2f}")
