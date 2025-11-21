@@ -57,17 +57,26 @@ def save_to_google_sheets(df):
         st.error(f"Kaydetme Hatası: {e}")
 
 def load_from_google_sheets():
-    """Veriyi okur ve sayısal formatları düzeltir."""
+    """Veriyi okur, sayısal formatları düzeltir ve EKSİK SÜTUNLARI TAMAMLAR."""
     try:
         sheet = connect_sheet()
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
         
-        # Sütunlar eksikse veya sayfa boşsa boş dön
+        # Beklenen tüm sütunlar
         required_cols = ["Ticker","Durum","Miktar","Son_Islem_Fiyati","Nakit_Bakiye_USD","Baslangic_USD","Kaydedilen_Deger_USD","Son_Islem_Log","Son_Islem_Zamani"]
         
+        # Sayfa boşsa standart yapıyı dön
         if df.empty:
             return pd.DataFrame(columns=required_cols)
+
+        # KRİTİK DÜZELTME: Eğer yeni sütunlar eski tabloda yoksa, onları ekle (Çökmemesi için)
+        for col in required_cols:
+            if col not in df.columns:
+                if "USD" in col or "Miktar" in col or "Fiyat" in col:
+                    df[col] = 0.0
+                else:
+                    df[col] = "-"
 
         # Sayısal dönüşümler
         numeric_cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
@@ -80,6 +89,7 @@ def load_from_google_sheets():
         return df
     except Exception as e:
         st.warning(f"Veri okuma uyarısı (Sıfırla butonunu kullanın): {e}")
+        # Hata durumunda boş ama doğru formatta tablo dön
         return pd.DataFrame(columns=["Ticker","Durum","Miktar","Son_Islem_Fiyati","Nakit_Bakiye_USD","Baslangic_USD","Kaydedilen_Deger_USD","Son_Islem_Log","Son_Islem_Zamani"])
 
 # ---------------------------------------------------------
@@ -263,12 +273,9 @@ def run_bot_logic(portfolio_df, signals_df):
                 add_log(f"🟢 {ticker}: ALIŞ yapıldı (${cash_available:.2f})")
         
         else:
-            # İşlem yoksa bile loga BEKLE yazalım ki güncel olduğu belli olsun
-            # Ama sadece durum değişirse veya fiyat güncellenirse
             pass
 
-        # Her işlem döngüsünde (AL/SAT veya BEKLE) güncel piyasa değerini 'Kaydedilen_Deger' olarak güncelle
-        # Böylece bir sonraki girişte bu değere göre fark hesaplanır.
+        # Her işlem döngüsünde güncel değeri kaydet
         if updated_portfolio.at[idx, 'Durum'] == 'COIN':
             val = float(updated_portfolio.at[idx, 'Miktar']) * current_price
         else:
@@ -289,32 +296,34 @@ with st.sidebar:
     default_tickers = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","AVAX-USD","DOGE-USD","ADA-USD"]
     selected_tickers = st.multiselect("Coinler", default_tickers, default=default_tickers)
     
-    if st.button("⚠️ SİMÜLASYONU SIFIRLA (Tüm Veriler Silinir)"):
+    if st.button("⚠️ SİMÜLASYONU SIFIRLA (Tabloyu Yenile)"):
         init_simulation(selected_tickers, 10)
-        st.success("Portföy sıfırlandı.")
+        st.success("Portföy sıfırlandı ve yeni sütunlar eklendi.")
         time.sleep(1)
         st.rerun()
         
     st.markdown("---")
-    st.info("Bot, 'Analiz Et' butonuna bastığında işlem yapar ve Google Sheets'i günceller. Sayfayı her açtığında veriler otomatık çekilir.")
+    st.info("Bot, 'Analiz Et' butonuna bastığında işlem yapar ve Google Sheets'i günceller.")
 
 # Ana Ekran - Veri Yükleme
 pf_df = load_portfolio()
 
 if pf_df.empty:
-    st.warning("Veri bulunamadı. Lütfen soldan 'Simülasyonu Sıfırla' butonuna basın.")
+    st.warning("Veri bulunamadı veya tablo boş. Lütfen soldan 'Simülasyonu Sıfırla' butonuna basın.")
 else:
     # 1. ANLIK FİYATLARI ÇEK VE DEĞER HESAPLA
-    # Burası sayfa her yüklendiğinde çalışır (Botu çalıştırmadan önce bilgi verir)
     current_prices = {}
     total_current_value = 0.0
-    total_saved_value = pf_df['Kaydedilen_Deger_USD'].sum()
-    total_invested = pf_df['Baslangic_USD'].sum()
     
-    # Sadece fiyatları çekiyoruz (Hızlı olması için)
+    # 'Kaydedilen_Deger_USD' sütunu eksikse 0 kabul et (Hata önleyici)
+    if 'Kaydedilen_Deger_USD' in pf_df.columns:
+        total_saved_value = pf_df['Kaydedilen_Deger_USD'].sum()
+    else:
+        total_saved_value = 0.0
+        
+    total_invested = pf_df['Baslangic_USD'].sum()
     tickers_list = pf_df['Ticker'].tolist()
     
-    # Basit bir progress bar ile fiyatları çek
     with st.spinner("Piyasa verileri güncelleniyor..."):
         for t in tickers_list:
             d = get_data_cached(t)
@@ -329,7 +338,6 @@ else:
     for idx, row in pf_df.iterrows():
         curr_price = current_prices.get(row['Ticker'], 0.0)
         
-        # Varlık Değeri Hesapla
         if row['Durum'] == 'COIN':
             asset_val = float(row['Miktar']) * curr_price
         else:
@@ -337,21 +345,24 @@ else:
         
         total_current_value += asset_val
         
-        # Kâr/Zarar
         pnl = asset_val - float(row['Baslangic_USD'])
         pnl_pct = (pnl / float(row['Baslangic_USD'])) * 100 if float(row['Baslangic_USD']) > 0 else 0.0
         
+        # Sütunlar eksikse "-" yaz
+        son_islem = row.get('Son_Islem_Log', '-')
+        son_zaman = row.get('Son_Islem_Zamani', '-')
+
         display_data.append({
             "Coin": row['Ticker'],
             "Durum": row['Durum'],
             "Fiyat": curr_price,
             "Değer ($)": asset_val,
-            "Son İşlem": f"{row['Son_Islem_Log']} ({row['Son_Islem_Zamani']})", # Yeni Özellik
+            "Son İşlem": f"{son_islem} ({son_zaman})",
             "Net Kâr ($)": pnl,
             "Kâr %": pnl_pct
         })
 
-    # 3. ÖZET METRİKLER (SON GİRİŞTEN BERİ FARK)
+    # 3. METRİKLER
     change_since_last = total_current_value - total_saved_value
     
     m1, m2, m3, m4 = st.columns(4)
@@ -359,7 +370,7 @@ else:
     m2.metric("Son Girişten Beri", f"${change_since_last:+.2f}", delta_color="normal")
     m3.metric("Net Kâr (Genel)", f"${(total_current_value - total_invested):+.2f}")
     
-    # 4. BOT ÇALIŞTIRMA BUTONU
+    # 4. BOT BUTONU
     col_btn, col_empty = st.columns([1,3])
     signals_df = None
     with col_btn:
@@ -371,11 +382,10 @@ else:
                 time.sleep(1)
                 st.rerun()
 
-    # 5. DETAYLI TABLO
-    # Sinyal bilgisini tabloya ekleyelim (Eğer butona basıldıysa)
+    # 5. TABLO GÖSTERİMİ
     final_table = pd.DataFrame(display_data)
+    
     if signals_df is not None:
-        # Sinyalleri tabloya merge edebiliriz ama basitçe gösterelim
         st.write("### 📊 Anlık Sinyaller")
         st.dataframe(signals_df.style.format({"Fiyat": "${:.2f}"}))
 
