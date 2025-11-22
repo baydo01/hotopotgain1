@@ -1,1 +1,33 @@
+name: Hedge Fund Bot Runner
 
+on:
+  schedule:
+    # Her 4 saatte bir çalıştır (UTC saatine göre)
+    # "0 */4 * * *" -> Her 4 saatte bir demektir.
+    - cron: '0 */4 * * *' 
+  workflow_dispatch: # GitHub üzerinden manuel "Run" butonu ekler
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu Çek (Checkout)
+        uses: actions/checkout@v3
+
+      - name: Python Kurulumu
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Kütüphaneleri Yükle
+        run: |
+          pip install -r requirements.txt
+
+      - name: Botu Çalıştır
+        env:
+          # GitHub Secrets'tan verileri alıp koda gönderiyoruz
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          python bot.py
