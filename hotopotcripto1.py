@@ -34,7 +34,7 @@ TARGET_COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD
 DATA_PERIOD = "3y" # 3 Yıllık veri çekmek için güncellendi
 
 with st.sidebar:
-    st.header("⚙️ Ayarlar") # U+00A0 hatası düzeltildi
+    st.header("⚙️ Ayarlar") # SyntaxError (U+00A0) hatası düzeltildi
     use_ga = st.checkbox("Genetic Algoritma (GA) Optimizasyonu", value=True)
     ga_gens = st.number_input("GA Döngüsü", 1, 20, 5)
     st.info("Sistem, en yüksek Alpha'yı üreten zaman dilimini (Günlük/Haftalık/Aylık) seçer.")
@@ -188,7 +188,8 @@ def ga_optimize(df, n_gen=5):
             train = df.iloc[:-30]; test = df.iloc[-30:]
             current_features = [f for f in features if f in train.columns]
             
-            if not current_features: continue
+            # Veri kümesinin boş olmamasını veya özelliklerin mevcut olmasını sağla
+            if not current_features or train.empty: continue
 
             rf = RandomForestClassifier(n_estimators=n, max_depth=d).fit(train[current_features], train['target'])
             score = rf.score(test[current_features], test['target'])
@@ -210,6 +211,10 @@ def train_meta_learner(df, params=None):
     base_features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     X_tr = train[base_features]; y_tr = train['target']
     X_test = test[base_features]
+
+    # Model eğitiminden önce X_tr ve y_tr'nin boş olmadığından emin ol
+    if X_tr.empty or y_tr.empty: return 0.0, None
+
 
     # 1. RandomForest, 2. XGBoost eğitimi (Yeni özelliklerle)
     rf = RandomForestClassifier(n_estimators=rf_n, max_depth=rf_d, random_state=42).fit(X_tr, y_tr)
