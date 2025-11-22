@@ -212,7 +212,7 @@ def estimate_arch_garch_models(returns):
             
     # Ortak bir Oynaklık Puanı: Tahminlerin ortalaması (Sıfırdan büyük olanlar)
     vol_list = [v for v in vol_estimates if v > 0]
-    return float(np.mean(vol_list)) if vol_list else 0.0 # float() eklenerek tip zorlandı
+    return float(np.mean(vol_list)) if vol_list else 0.0
 
 def estimate_arima_models(prices, is_sarima=False):
     """ARIMA/SARIMA modellerini eğitir ve tek adım ilerideki tahmini döndürür."""
@@ -230,7 +230,7 @@ def estimate_arima_models(prices, is_sarima=False):
         forecast_price = last_price * (1 + forecast_ret)
         
         # Gelecek fiyata dayalı olarak AL/SAT sinyali üretmek için normalize ediyoruz (mevcut fiyatın yüzdesi olarak)
-        return float((forecast_price / last_price) - 1.0) # float() eklenerek tip zorlandı
+        return float((forecast_price / last_price) - 1.0)
     except Exception:
         return 0.0
 
@@ -294,8 +294,8 @@ def train_meta_learner(df, params=None):
     xgb_c = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3).fit(X_tr, y_tr)
     
     # 3. HMM eğitimi
-    scaler = StandardScaler()
-    X_hmm = scaler.fit_transform(train[['log_ret', 'range_vol_delta']])
+    scaler_hmm = StandardScaler() # Yeni scaler oluşturuldu
+    X_hmm = scaler_hmm.fit_transform(train[['log_ret', 'range_vol_delta']])
     hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50, random_state=42)
     try: hmm.fit(X_hmm)
     except: hmm = None
@@ -313,26 +313,31 @@ def train_meta_learner(df, params=None):
         'HMM': hmm_pred,
         'Heuristic': train['heuristic'].values,
         'Historical_Avg_Score': train['historical_avg_score'].values, 
-        # Yeni Modelleri eklerken float tipinde sabit değerler kullanıyoruz
         'ARIMA_Signal': np.full(len(train), arima_signal, dtype=np.float64), 
         'SARIMA_Signal': np.full(len(train), sarima_signal, dtype=np.float64), 
         'GARCH_Volatility': np.full(len(train), garch_score_tr, dtype=np.float64), 
         'Vol_Signal': np.full(len(train), garch_signal, dtype=np.float64) 
     })
     
-    # Meta Öğreniciyi eğit (Tüm Model Çıktılarını Birleştirir)
-    meta_model = LogisticRegression().fit(meta_X, y_tr)
+    # --- KRİTİK DÜZELTME: Sinyal Normalizasyonu (RF/XGB hariç) ---
+    meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Signal', 'SARIMA_Signal', 'GARCH_Volatility', 'Vol_Signal']
+    
+    scaler_meta = StandardScaler()
+    meta_X[meta_features_to_scale] = scaler_meta.fit_transform(meta_X[meta_features_to_scale])
+
+    # --- KRİTİK DÜZELTME: Düzenlileştirme ile Logistic Regression eğitimi ---
+    meta_model = LogisticRegression(C=0.1, solver='liblinear').fit(meta_X, y_tr)
     weights = meta_model.coef_[0]
     
     # --- YENİ ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Test Verisi Üzerinde) ---
 
-    # ARIMA/SARIMA Sinyalleri (Fiyat Tahmin Getirisi) - Test verisi için (float tipine zorlandı)
+    # ARIMA/SARIMA Sinyalleri (Test verisi için)
     try: arima_signal_test = float(np.sign(estimate_arima_models(test['close'], is_sarima=False)))
     except: arima_signal_test = 0.0
     try: sarima_signal_test = float(np.sign(estimate_arima_models(test['close'], is_sarima=True)))
     except: sarima_signal_test = 0.0
 
-    # ARCH/GARCH Oynaklık Puanı - Test verisi için (float tipine zorlandı)
+    # ARCH/GARCH Oynaklık Puanı (Test verisi için)
     garch_score_test = estimate_arch_garch_models(test['ret'].replace([np.inf, -np.inf], np.nan).dropna())
     scaled_range_test = scaler_vol.transform(np.array(test['range'].values).reshape(-1, 1)).flatten()
     garch_signal_test = float(-np.sign(scaled_range_test[-1])) if len(scaled_range_test) > 0 else 0.0
@@ -341,12 +346,11 @@ def train_meta_learner(df, params=None):
     sim_eq=[100]; hodl_eq=[100]; cash=100; coin=0; p0=test['close'].iloc[0]
     
     # Test verisi için HMM tahminleri
-    X_hmm_t = scaler.transform(test[['log_ret','range_vol_delta']])
+    X_hmm_t = scaler_hmm.transform(test[['log_ret','range_vol_delta']])
     hmm_p_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
     hmm_s_t = hmm_p_t[:, np.argmax(hmm.means_[:,0])] - hmm_p_t[:, np.argmin(hmm.means_[:,0])] if hmm else np.zeros(len(test))
     
     # Test verisi için Meta Öğrenici Girdileri
-    # mx_test'in tüm sütunlarının float64 olduğundan emin olmak için oluşturma sırasında dtype zorlandı
     mx_test = pd.DataFrame({
         'RF': rf.predict_proba(X_test)[:,1],
         'XGB': xgb_c.predict_proba(X_test)[:,1],
@@ -360,7 +364,9 @@ def train_meta_learner(df, params=None):
         'Vol_Signal': np.full(len(test), garch_signal_test, dtype=np.float64)
     })
     
-    # Hata veren satır: Artık mx_test'in float64 içerdiğinden eminiz.
+    # Test verisine Normalizasyon uygulama
+    mx_test[meta_features_to_scale] = scaler_meta.transform(mx_test[meta_features_to_scale])
+
     probs = meta_model.predict_proba(mx_test)[:,1] 
     
     # Ticaret Simülasyonu
