@@ -14,3 +14,17 @@ deap>=1.3.3
 optuna>=3.4.0
 plotly>=5.18.0
 numba>=0.57.1
+# requirements.txt
+streamlit
+yfinance
+pandas
+numpy
+gspread
+oauth2client
+hmmlearn
+scikit-learn
+xgboost
+plotly
+statsmodels
+pmdarima      # Yeni eklendi
+arch          # Yeni eklendi
