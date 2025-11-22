@@ -23,6 +23,7 @@ from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPRegressor # KRİTİK EKLEME: NNAR (Doğrusal Olmayan Zaman Serisi) için
 import xgboost as xgb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -197,7 +198,7 @@ def select_best_garch_model(returns):
     models_to_test = {
         'GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 0, 'q': 1},
         'GJR-GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 1, 'q': 1},
-        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1} # ARCH denemesi çıkarıldı, GJR/APARCH daha mantıklı
+        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1}
     }
     
     best_aic = np.inf
@@ -208,8 +209,7 @@ def select_best_garch_model(returns):
             am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT') 
             res = am.fit(disp='off')
             
-            # KRİTİK GÜNCELLEME 2.2: Kalıntı Analizi (Ljung-Box Testi)
-            # Kalıntı kareleri üzerinde otokorelasyon testi yapılır (Arch modelinin geçerliliği için)
+            # Kalıntı Analizi (Ljung-Box Testi)
             ljung_box_result = acorr_ljungbox(res.resid**2, lags=[10], return_df=True)
             ljung_box_p_value = ljung_box_result['lb_pvalue'].iloc[-1]
             
@@ -227,7 +227,6 @@ def select_best_garch_model(returns):
 
 def estimate_arch_garch_models(returns):
     """Akıllı model seçimi ile GARCH tahminini döndürür."""
-    # Sadece en iyi GARCH modelinin oynaklık tahminini döndürür.
     forecast = select_best_garch_model(returns)
     return forecast
 
@@ -246,13 +245,11 @@ def estimate_arima_models(prices, is_sarima=False):
                               suppress_warnings=True, 
                               trace=False, 
                               error_action='ignore',
-                              # KRİTİK GÜNCELLEME 3.3: Yeo-Johnson'a izin vermek için power_transform açık
                               power_transform=True, 
                               d=None, D=None, 
                               scoring='aic') 
 
-        # KRİTİK GÜNCELLEME 3.4: Kalıntı Analizi (Ljung-Box Testi)
-        # Modelin kalıntıları üzerinde otokorelasyon testi yapılır
+        # Kalıntı Analizi (Ljung-Box Testi)
         ljung_box_result = acorr_ljungbox(model.resid(), lags=[10], return_df=True)
         ljung_box_p_value = ljung_box_result['lb_pvalue'].iloc[-1]
 
@@ -271,6 +268,34 @@ def estimate_arima_models(prices, is_sarima=False):
         
     except Exception:
         return 0.0
+
+def estimate_nnar_models(returns):
+    """KRİTİK EKLEME: MLPRegressor kullanarak basit NNAR (Yapay Sinir Ağı) tabanlı getiri tahmini."""
+    if len(returns) < 100: return 0.0
+    
+    # Geçmiş 5 günün getirisini (lag) kullanarak gelecek getiri tahmini
+    lags = 5
+    X = pd.DataFrame({f'lag_{i}': returns.shift(i) for i in range(1, lags + 1)}).dropna()
+    y = returns[lags:]
+    
+    if X.empty or len(X) < 10: return 0.0
+    
+    try:
+        # Veri setini eğit/test olarak bölme (Basitçe son noktayı tahmin edeceğiz)
+        X_train = X.iloc[:-1]
+        y_train = y.iloc[:-1]
+        X_forecast = X.iloc[-1].values.reshape(1, -1)
+        
+        # MLPRegressor eğitimi (Basit bir tek katmanlı sinir ağı)
+        nnar_model = MLPRegressor(hidden_layer_sizes=(10, ), max_iter=100, solver='lbfgs', random_state=42)
+        nnar_model.fit(X_train, y_train)
+        
+        # Tahmin
+        forecast_ret = nnar_model.predict(X_forecast)[0]
+        return float(forecast_ret)
+    except Exception:
+        return 0.0
+
 
 def ga_optimize(df, n_gen=5):
     """Genetic Algoritma ile basit RF modelini optimize eder."""
@@ -316,6 +341,9 @@ def train_meta_learner(df, params=None):
     arima_getiri = estimate_arima_models(train['close'], is_sarima=False)
     sarima_getiri = estimate_arima_models(train['close'], is_sarima=True)
     
+    # NNAR Sinyali
+    nnar_getiri = estimate_nnar_models(train['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
+    
     # ARCH/GARCH Modellerinden Akıllı Seçim ile Tek Bir Oynaklık Puanı - Ham Volatilite değeri kullanılıyor
     garch_score_tr = estimate_arch_garch_models(train['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
     
@@ -349,15 +377,16 @@ def train_meta_learner(df, params=None):
         'HMM': hmm_pred,
         'Heuristic': train['heuristic'].values,
         'Historical_Avg_Score': train['historical_avg_score'].values, 
-        # KRİTİK GÜNCELLEME 4.1: Sinyalin şiddeti (Ham Getiri) kullanılıyor
+        # KRİTİK GÜNCELLEME: Sinyalin şiddeti (Ham Getiri) kullanılıyor
         'ARIMA_Return': np.full(len(train), arima_getiri, dtype=np.float64), 
         'SARIMA_Return': np.full(len(train), sarima_getiri, dtype=np.float64), 
+        'NNAR_Return': np.full(len(train), nnar_getiri, dtype=np.float64), # YENİ SİNYAL
         'GARCH_Volatility': np.full(len(train), garch_score_tr, dtype=np.float64), 
         'Vol_Signal': np.full(len(train), garch_signal, dtype=np.float64) 
     })
     
     # --- KRİTİK DÜZELTME: Sinyal Normalizasyonu (RF/XGB hariç) ---
-    meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Return', 'SARIMA_Return', 'GARCH_Volatility', 'Vol_Signal']
+    meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Return', 'SARIMA_Return', 'NNAR_Return', 'GARCH_Volatility', 'Vol_Signal']
     
     scaler_meta = StandardScaler()
     meta_X[meta_features_to_scale] = scaler_meta.fit_transform(meta_X[meta_features_to_scale])
@@ -371,6 +400,9 @@ def train_meta_learner(df, params=None):
     # ARIMA/SARIMA Sinyalleri (Test verisi için)
     arima_getiri_test = estimate_arima_models(test['close'], is_sarima=False)
     sarima_getiri_test = estimate_arima_models(test['close'], is_sarima=True)
+    
+    # NNAR Sinyali (Test verisi için)
+    nnar_getiri_test = estimate_nnar_models(test['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
     
     # ARCH/GARCH Oynaklık Puanı (Test verisi için)
     garch_score_test = estimate_arch_garch_models(test['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
@@ -395,6 +427,7 @@ def train_meta_learner(df, params=None):
         # KRİTİK GÜNCELLEME 4.2: Sinyalin şiddeti (Ham Getiri) kullanılıyor
         'ARIMA_Return': np.full(len(test), arima_getiri_test, dtype=np.float64), 
         'SARIMA_Return': np.full(len(test), sarima_getiri_test, dtype=np.float64),
+        'NNAR_Return': np.full(len(test), nnar_getiri_test, dtype=np.float64), # YENİ SİNYAL
         'GARCH_Volatility': np.full(len(test), garch_score_test, dtype=np.float64),
         'Vol_Signal': np.full(len(test), garch_signal_test, dtype=np.float64)
     })
@@ -420,8 +453,9 @@ def train_meta_learner(df, params=None):
         'HMM',
         'Senin Kuralın (Heuristic)',
         'Tarihsel Ortalamalar',
-        'ARIMA Getiri Tahmini', # Güncellendi
-        'SARIMA Getiri Tahmini', # Güncellendi
+        'ARIMA Getiri Tahmini', 
+        'SARIMA Getiri Tahmini', 
+        'NNAR Getiri Tahmini', # YENİ SİNYAL
         'GARCH Oynaklık Skoru', 
         'Oynaklık Sinyali'
     ]
