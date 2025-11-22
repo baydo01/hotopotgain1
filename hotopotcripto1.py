@@ -13,9 +13,10 @@ import pytz
 
 # --- Yeni İstatiksel Kütüphaneler ---
 from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.stats.diagnostic import acorr_ljungbox # Ljung-Box testi için
 import pmdarima as pm
 from arch import arch_model
-from scipy.stats import boxcox # Box-Cox dönüşümü için
+from scipy.stats import boxcox, yeojohnson # Dönüşümler için
 
 # --- AI & ML Kütüphaneleri ---
 from hmmlearn.hmm import GaussianHMM
@@ -146,12 +147,10 @@ def process_data(df, timeframe):
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
     
     # KRİTİK GÜNCELLEME 1: Log-Return Zorunluluğu
-    # Logaritmik getiri finansal ekonometrik modeller için zorunludur.
     df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
     
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close'] # 'range' burada oluşturuldu
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    # df_res['ret'] yerine log_ret kullanılıyor, ancak bazı heuristikler için tutuldu
     df_res['ret'] = df_res['close'].pct_change() 
 
     # YENİ İSTATİSTİKSEL MODELLER/ÖZELLİKLER (İstenen geliştirmeler)
@@ -190,16 +189,15 @@ def process_data(df, timeframe):
 # =============================================================================
 
 def select_best_garch_model(returns):
-    """Farklı ARCH/GARCH modellerini AIC/BIC kriterine göre seçer."""
-    # KRİTİK GÜNCELLEME 2.1: returns'ün log-return olduğunu varsayıyoruz
+    """Farklı ARCH/GARCH modellerini AIC/BIC kriterine göre seçer ve kalıntıları kontrol eder."""
+    returns = returns.copy()
     if len(returns) < 200:
-        return 0.0, None # Yeterli veri yok
+        return 0.0 # Yeterli veri yok
 
     models_to_test = {
         'GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 0, 'q': 1},
         'GJR-GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 1, 'q': 1},
-        'ARCH(1)': {'vol': 'ARCH', 'p': 1, 'o': 0, 'q': 0},
-        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1}
+        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1} # ARCH denemesi çıkarıldı, GJR/APARCH daha mantıklı
     }
     
     best_aic = np.inf
@@ -207,58 +205,65 @@ def select_best_garch_model(returns):
     
     for name, params in models_to_test.items():
         try:
-            # Student's T dağılımı ve 100 ile ölçeklendirme (arch paketi için)
             am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT') 
             res = am.fit(disp='off')
             
-            if res.aic < best_aic:
+            # KRİTİK GÜNCELLEME 2.2: Kalıntı Analizi (Ljung-Box Testi)
+            # Kalıntı kareleri üzerinde otokorelasyon testi yapılır (Arch modelinin geçerliliği için)
+            ljung_box_result = acorr_ljungbox(res.resid**2, lags=[10], return_df=True)
+            ljung_box_p_value = ljung_box_result['lb_pvalue'].iloc[-1]
+            
+            # Modelin kalıntıları Beyaz Gürültü varsayımını sağlamalı (p-value > 0.05)
+            if res.aic < best_aic and ljung_box_p_value > 0.05:
                 best_aic = res.aic
                 forecast = res.forecast(horizon=1)
-                # Oynaklığı (volatilite) standart sapma olarak alıyoruz, ölçeklendirmeyi geri alıyoruz
-                best_forecast = np.sqrt(forecast.variance.iloc[-1, 0]) / 100
-                
+                best_forecast = np.sqrt(forecast.variance.iloc[-1, 0]) / 100 # Ölçeklendirmeyi geri al
+
         except Exception:
             continue
             
-    # En iyi modelin volatilite tahmini döndürülür
-    return float(best_forecast) if best_forecast else 0.0, best_aic 
+    # Eğer en iyi model geçerliyse (Ljung-Box'u geçtiyse) tahmin döndürülür
+    return float(best_forecast) if best_forecast else 0.0 
 
 def estimate_arch_garch_models(returns):
     """Akıllı model seçimi ile GARCH tahminini döndürür."""
-    forecast, aic = select_best_garch_model(returns)
+    # Sadece en iyi GARCH modelinin oynaklık tahminini döndürür.
+    forecast = select_best_garch_model(returns)
     return forecast
 
 def estimate_arima_models(prices, is_sarima=False):
-    """ARIMA/SARIMA modellerini Box-Cox/Log dönüşümü ve otomatik AIC seçimi ile eğitir."""
+    """ARIMA/SARIMA modellerini otomatik AIC seçimi ve kalıntı kontrolü ile eğitir."""
     
     # Getiri Serisi kullanılır (log-return)
     returns = np.log(prices / prices.shift(1)).dropna()
     if len(returns) < 50: return 0.0
     
-    # KRİTİK GÜNCELLEME 3.1: Box-Cox dönüşümü için pozitiflik kontrolü
-    # Log-return serisi negatif değerler içerir. Bu durumda Box-Cox uygulanamaz.
-    # pm.auto_arima'nın bu seriler için log-dönüşümü denemesini sağlamak için 'power_transform' kapatılabilir 
-    # veya Yeo-Johnson'a güveniriz. Ancak pm.auto_arima'yı doğrudan log-return serisine uygulamak en güvenlisidir.
-    
     try:
-        # pm.auto_arima: Otomatik model seçimi, differencing ve mevsimsellik yönetimi
+        # pm.auto_arima: Otomatik model seçimi, Yeo-Johnson dönüşümü (negatif değerler için daha güvenli)
         model = pm.auto_arima(returns, 
                               seasonal=is_sarima, m=5 if is_sarima else 1, 
                               stepwise=True, 
                               suppress_warnings=True, 
                               trace=False, 
                               error_action='ignore',
-                              # KRİTİK GÜNCELLEME 3.2: Log-Return kullandığımız için, Box-Cox'u kapatmak daha güvenlidir.
-                              # Ya da power_transform=True ile Yeo-Johnson'a güveniriz. Şimdilik Yeo-Johnson'a güvendik.
-                              power_transform=True, max_power=2,
+                              # KRİTİK GÜNCELLEME 3.3: Yeo-Johnson'a izin vermek için power_transform açık
+                              power_transform=True, 
                               d=None, D=None, 
                               scoring='aic') 
+
+        # KRİTİK GÜNCELLEME 3.4: Kalıntı Analizi (Ljung-Box Testi)
+        # Modelin kalıntıları üzerinde otokorelasyon testi yapılır
+        ljung_box_result = acorr_ljungbox(model.resid(), lags=[10], return_df=True)
+        ljung_box_p_value = ljung_box_result['lb_pvalue'].iloc[-1]
+
+        # Model kalıntıları Beyaz Gürültü olmalıdır (p-value > 0.05)
+        if ljung_box_p_value < 0.05:
+            return 0.0 # Kalıntılar Beyaz Gürültü değil, model geçersiz
         
         forecast_ret = model.predict(n_periods=1)[0]
         
-        # Tahmin edilen getiriyi fiyata dönüştür
-        last_price = prices.iloc[-1]
         # Log-Return'den fiyata dönüşüm: P_t+1 = P_t * exp(r_t+1)
+        last_price = prices.iloc[-1]
         forecast_price = last_price * np.exp(forecast_ret)
         
         # Sinyal: % Getiri tahmini
@@ -352,7 +357,6 @@ def train_meta_learner(df, params=None):
     })
     
     # --- KRİTİK DÜZELTME: Sinyal Normalizasyonu (RF/XGB hariç) ---
-    # Log-Return artık sinyal olarak kullanıldığı için isimleri güncelledik
     meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Return', 'SARIMA_Return', 'GARCH_Volatility', 'Vol_Signal']
     
     scaler_meta = StandardScaler()
