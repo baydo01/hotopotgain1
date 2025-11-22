@@ -178,12 +178,15 @@ def select_best_garch_model(returns):
         try:
             am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT')
             res = am.fit(disp='off')
+            
             lb_p = acorr_ljungbox(res.resid**2, lags=[10], return_df=True)['lb_pvalue'].iloc[-1]
+            
             if res.aic < best_aic and lb_p > 0.05:
                 best_aic = res.aic
                 forecast = res.forecast(horizon=1)
                 best_forecast = np.sqrt(forecast.variance.iloc[-1, 0]) / 100
         except: continue
+            
     return float(best_forecast) if best_forecast else 0.0
 
 def estimate_arch_garch_models(returns):
@@ -192,12 +195,15 @@ def estimate_arch_garch_models(returns):
 def estimate_arima_models(prices, is_sarima=False):
     returns = np.log(prices / prices.shift(1)).dropna()
     if len(returns) < 50: return 0.0
+    
     try:
         model = pm.auto_arima(returns, seasonal=is_sarima, m=5 if is_sarima else 1, stepwise=True, 
                               suppress_warnings=True, trace=False, error_action='ignore',
                               power_transform=True, d=None, D=None, scoring='aic')
+        
         lb_p = acorr_ljungbox(model.resid(), lags=[10], return_df=True)['lb_pvalue'].iloc[-1]
         if lb_p < 0.05: return 0.0
+        
         forecast_ret = model.predict(n_periods=1)[0]
         last_price = prices.iloc[-1]
         forecast_price = last_price * np.exp(forecast_ret)
@@ -210,6 +216,7 @@ def estimate_nnar_models(returns):
     X = pd.DataFrame({f'lag_{i}': returns.shift(i) for i in range(1, lags + 1)}).dropna()
     y = returns[lags:]
     if X.empty or len(X) < 10: return 0.0
+    
     try:
         X_train = X.iloc[:-1]; y_train = y.iloc[:-1]
         X_forecast = X.iloc[-1].values.reshape(1, -1)
@@ -249,12 +256,11 @@ def train_meta_learner(df, params=None):
     if len(df) < test_size + 50: return 0.0, None
     train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
     
-    # DÜZELTME: Özellik seti kontrolü
     base_features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     X_tr = train[base_features]; y_tr = train['target']
     X_test = test[base_features]
 
-    if X_tr.empty or y_tr.empty or len(X_tr) != len(y_tr): return 0.0, None
+    if X_tr.empty or y_tr.empty: return 0.0, None
 
     arima_getiri = estimate_arima_models(train['close'], is_sarima=False)
     sarima_getiri = estimate_arima_models(train['close'], is_sarima=True)
@@ -299,13 +305,10 @@ def train_meta_learner(df, params=None):
         'Vol_Signal': np.full(len(train), garch_signal, dtype=np.float64) 
     }, index=train.index)
     
-    # DÜZELTME: HMM verisini güvenli birleştirme (Indexe göre)
     meta_X = pd.concat([meta_X, hmm_prob_df], axis=1).dropna()
     
-    # Hedef değişkeni de meta_X'in indexine göre hizala (Eşleşmeyenleri at)
     y_tr = y_tr.loc[meta_X.index]
 
-    # Temizlik
     meta_X = meta_X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     meta_features_to_scale = [
@@ -320,14 +323,11 @@ def train_meta_learner(df, params=None):
 
     meta_X = meta_X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # DÜZELTME: Hata kontrolü - Veri boyutları eşit mi?
     if len(meta_X) != len(y_tr):
-        print("Veri boyutu uyumsuzluğu giderildi.")
         common_idx = meta_X.index.intersection(y_tr.index)
         meta_X = meta_X.loc[common_idx]
         y_tr = y_tr.loc[common_idx]
 
-    # Agresif Kâr Modu: C=1.0
     meta_model = LogisticRegression(C=1.0, solver='liblinear', penalty='l2').fit(meta_X, y_tr)
     weights = meta_model.coef_[0]
     
@@ -366,7 +366,7 @@ def train_meta_learner(df, params=None):
 
     probs = meta_model.predict_proba(mx_test)[:,1] 
     
-    # SİMÜLASYON
+    # --- SİMÜLASYON DEĞİŞKENLERİNİN TANIMLANMASI ---
     sim_eq=[100]; hodl_eq=[100]; cash=100; coin=0; p0=test['close'].iloc[0]
 
     for i in range(len(test)):
