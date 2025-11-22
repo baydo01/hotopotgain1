@@ -15,6 +15,7 @@ import pytz
 from statsmodels.tsa.arima.model import ARIMA
 import pmdarima as pm
 from arch import arch_model
+from scipy.stats import boxcox # Box-Cox dönüşümü için
 
 # --- AI & ML Kütüphaneleri ---
 from hmmlearn.hmm import GaussianHMM
@@ -183,54 +184,80 @@ def process_data(df, timeframe):
 # 4. AI MOTORU - MODEL EĞİTİMİ VE ENSEMBLE
 # =============================================================================
 
-def estimate_arch_garch_models(returns):
-    """Farklı ARCH/GARCH modellerini eğitir ve son oynaklık tahminlerini döndürür."""
-    if len(returns) < 100:
-        return 0.0
+def select_best_garch_model(returns):
+    """Farklı ARCH/GARCH modellerini AIC/BIC kriterine göre seçer."""
+    if len(returns) < 200:
+        return 0.0, None # Yeterli veri yok
 
-    models = {
-        'ARCH': {'p': 1, 'o': 0, 'q': 0, 'vol': 'ARCH'},
-        'GARCH': {'p': 1, 'o': 0, 'q': 1, 'vol': 'GARCH'},
-        'APGARCH': {'p': 1, 'o': 1, 'q': 1, 'vol': 'APARCH'},
-        'GJRGARCH': {'p': 1, 'o': 1, 'q': 1, 'vol': 'GARCH', 'pwr': True}
+    models_to_test = {
+        'GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 0, 'q': 1},
+        'GJR-GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 1, 'q': 1},
+        'ARCH(1)': {'vol': 'ARCH', 'p': 1, 'o': 0, 'q': 0},
+        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1}
     }
     
-    vol_estimates = []
-    for name, params in models.items():
+    best_aic = np.inf
+    best_forecast = 0.0
+    
+    for name, params in models_to_test.items():
         try:
-            if name == 'GJRGARCH' or name == 'APGARCH':
-                am = arch_model(100 * returns, vol='APARCH', p=1, o=1, q=1)
-            else:
-                am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'])
-
+            am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT') # Kripto için StudentsT dağılımı kullanıldı
             res = am.fit(disp='off')
-            forecast = res.forecast(horizon=1)
-            # Volatilite (standart sapma) olarak alıyoruz
-            vol_estimates.append(np.sqrt(forecast.variance.iloc[-1, 0]))
-        except Exception:
-            pass
             
-    # Ortak bir Oynaklık Puanı: Tahminlerin ortalaması (Sıfırdan büyük olanlar)
-    vol_list = [v for v in vol_estimates if v > 0]
-    return float(np.mean(vol_list)) if vol_list else 0.0
+            if res.aic < best_aic:
+                best_aic = res.aic
+                forecast = res.forecast(horizon=1)
+                best_forecast = np.sqrt(forecast.variance.iloc[-1, 0])
+                
+        except Exception:
+            continue
+            
+    return float(best_forecast) if best_forecast else 0.0, best_aic # En iyi modelin volatilite tahmini ve AIC'si
+
+def estimate_arch_garch_models(returns):
+    """Akıllı model seçimi ile GARCH tahminini döndürür."""
+    # Sadece en iyi GARCH modelinin oynaklık tahminini döndürür.
+    forecast, aic = select_best_garch_model(returns)
+    return forecast
 
 def estimate_arima_models(prices, is_sarima=False):
-    """ARIMA/SARIMA modellerini eğitir ve tek adım ilerideki tahmini döndürür."""
+    """ARIMA/SARIMA modellerini Box-Cox dönüşümü ve otomatik AIC seçimi ile eğitir ve tek adım ilerideki tahmini döndürür."""
+    
+    # 1. Durağan olmayan Fiyat Serisi üzerinde çalışmak yerine Getiri Serisi kullanılır
     returns = prices.pct_change().dropna()
     if len(returns) < 50: return 0.0
-
+    
+    # 2. pm.auto_arima'yı kullanarak en iyi modeli bulma
     try:
         if is_sarima:
-            model = pm.auto_arima(returns, seasonal=True, m=5, stepwise=True, suppress_warnings=True, trace=False)
+            # Otomatik SARIMA: Mevsimsel bileşen (m=5) ile
+            model = pm.auto_arima(returns, 
+                                  seasonal=True, m=5, 
+                                  stepwise=True, 
+                                  suppress_warnings=True, 
+                                  trace=False, 
+                                  error_action='ignore',
+                                  # Box-Cox dönüşümü otomatik olarak denenir
+                                  power_transform=True, max_power=2)
         else:
-            model = pm.auto_arima(returns, seasonal=False, stepwise=True, suppress_warnings=True, trace=False)
+            # Otomatik ARIMA: Durağanlık ve log/Box-Cox dönüşümü otomatik olarak yönetilir
+            model = pm.auto_arima(returns, 
+                                  seasonal=False, 
+                                  stepwise=True, 
+                                  suppress_warnings=True, 
+                                  trace=False, 
+                                  error_action='ignore',
+                                  power_transform=True, max_power=2)
         
         forecast_ret = model.predict(n_periods=1)[0]
+        
+        # 3. Tahmin edilen getiriyi fiyata dönüştür
         last_price = prices.iloc[-1]
         forecast_price = last_price * (1 + forecast_ret)
         
-        # Gelecek fiyata dayalı olarak AL/SAT sinyali üretmek için normalize ediyoruz (mevcut fiyatın yüzdesi olarak)
+        # Sinyal: % Getiri tahmini
         return float((forecast_price / last_price) - 1.0)
+        
     except Exception:
         return 0.0
 
@@ -275,12 +302,16 @@ def train_meta_learner(df, params=None):
     # --- YENİ ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Eğitim Verisi Üzerinde) ---
     
     # ARIMA/SARIMA Sinyalleri (Fiyat Tahmin Getirisi)
-    try: arima_signal = float(np.sign(estimate_arima_models(train['close'], is_sarima=False)))
+    arima_getiri = estimate_arima_models(train['close'], is_sarima=False)
+    sarima_getiri = estimate_arima_models(train['close'], is_sarima=True)
+    
+    # Sinyal: Getiri > 0 ise AL (+1), Getiri < 0 ise SAT (-1)
+    try: arima_signal = float(np.sign(arima_getiri))
     except: arima_signal = 0.0
-    try: sarima_signal = float(np.sign(estimate_arima_models(train['close'], is_sarima=True)))
+    try: sarima_signal = float(np.sign(sarima_getiri))
     except: sarima_signal = 0.0
     
-    # ARCH/GARCH Modellerinden Tek Bir Oynaklık Puanı (Eğitim Setinin sonu)
+    # ARCH/GARCH Modellerinden Akıllı Seçim ile Tek Bir Oynaklık Puanı
     garch_score_tr = estimate_arch_garch_models(train['ret'].replace([np.inf, -np.inf], np.nan).dropna())
     
     # Oynaklık Sinyali (Yüksek oynaklık negatif sinyal)
