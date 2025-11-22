@@ -31,8 +31,8 @@ from plotly.subplots import make_subplots
 # Gerekli uyarıları yoksay
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund AI: Canavar Motor", layout="wide")
-st.title("🏦 Hedge Fund AI: Canavar Motor")
+st.set_page_config(page_title="Hedge Fund AI: Agresif Kâr Modu", layout="wide")
+st.title("🚀 Hedge Fund AI: Agresif Kâr Modu (Ortak Kasa)")
 
 # =============================================================================
 # 1. AYARLAR VE SABİTLER
@@ -46,7 +46,7 @@ with st.sidebar:
     st.header("⚙️ Ayarlar")
     use_ga = st.checkbox("Genetic Algoritma (GA) Optimizasyonu", value=True)
     ga_gens = st.number_input("GA Döngüsü", 1, 20, 5)
-    st.info("Sistem, en yüksek Alpha'yı üreten zaman dilimini (Günlük/Haftalık/Aylık) seçer.")
+    st.info("Sistem, en yüksek Alpha'yı üreten zaman dilimini seçer ve en yüksek ROI potansiyeli olan coine yatırım yapar.")
 
 # =============================================================================
 # 2. GOOGLE SHEETS ENTEGRASYONU
@@ -203,15 +203,12 @@ def estimate_arch_garch_models(returns):
 def estimate_arima_models(prices, is_sarima=False):
     returns = np.log(prices / prices.shift(1)).dropna()
     if len(returns) < 50: return 0.0
-    
     try:
         model = pm.auto_arima(returns, seasonal=is_sarima, m=5 if is_sarima else 1, stepwise=True, 
                               suppress_warnings=True, trace=False, error_action='ignore',
                               power_transform=True, d=None, D=None, scoring='aic')
-        
         lb_p = acorr_ljungbox(model.resid(), lags=[10], return_df=True)['lb_pvalue'].iloc[-1]
         if lb_p < 0.05: return 0.0
-        
         forecast_ret = model.predict(n_periods=1)[0]
         last_price = prices.iloc[-1]
         forecast_price = last_price * np.exp(forecast_ret)
@@ -308,9 +305,8 @@ def train_meta_learner(df, params=None):
     }, index=train.index)
     
     meta_X = pd.concat([meta_X, hmm_prob_df], axis=1).dropna()
-    
     y_tr = y_tr.loc[meta_X.index]
-
+    
     meta_X = meta_X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     meta_features_to_scale = [
@@ -391,6 +387,9 @@ def train_meta_learner(df, params=None):
     
     return final_signal, info
 
+# =============================================================================
+# 5. TURNUVA FONKSİYONU
+# =============================================================================
 def analyze_ticker_tournament(ticker, status_placeholder):
     raw_df = get_raw_data(ticker)
     if raw_df is None: 
@@ -417,7 +416,10 @@ def analyze_ticker_tournament(ticker, status_placeholder):
             else: final_decision="BEKLE"
     return final_decision, current_price, winning_tf, best_info
 
-if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
+# =============================================================================
+# 6. ARAYÜZ (STREAMLIT) VE İŞLEM MANTIĞI
+# =============================================================================
+if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET (Ortak Kasa)", type="primary"):
     st.session_state['use_ga'] = use_ga
     tz = pytz.timezone('Europe/Istanbul')
     time_str = datetime.now(tz).strftime("%d-%m %H:%M")
@@ -427,7 +429,12 @@ if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
         st.error("Hata: Portföy yüklenemedi.")
     else:
         updated = pf_df.copy(); prog = st.progress(0); sim_summary=[]
-        
+        signals = [] # Ortak kasa için sinyal havuzu
+
+        # 1. Tüm Nakit Bakiyelerini Topla (Ortak Havuz)
+        total_cash_pool = updated['Nakit_Bakiye_USD'].sum()
+        st.info(f"💰 Başlangıç Ortak Nakit Havuzu: ${total_cash_pool:.2f}")
+
         for i,(idx,row) in enumerate(updated.iterrows()):
             ticker=row['Ticker']
             if len(str(ticker))<3: continue
@@ -437,49 +444,98 @@ if st.button("🚀 PORTFÖYÜ CANLI ANALİZ ET", type="primary"):
                 dec, prc, tf, info = analyze_ticker_tournament(ticker, ph)
                 
                 if dec!="HATA" and info:
+                    # Sinyali Havuza Ekle
+                    signals.append({
+                        'idx': idx, 'ticker': ticker, 'price': prc,
+                        'signal': 1 if dec=='AL' else (-1 if dec=='SAT' else 0),
+                        'roi': info['bot_roi'], 'tf': tf,
+                        'status': row['Durum'], 'amount': float(row['Miktar'])
+                    })
+
                     sim_summary.append({"Coin":ticker,"Kazanan TF":tf,"Bot ROI":info['bot_roi'],"HODL ROI":info['hodl_roi'],"Alpha":info['alpha']})
                     
+                    # Model Etki Dağılımı
                     w=info['weights']; w_names=info['weights_names']
                     w_abs=np.abs(w); w_norm=w_abs/(np.sum(w_abs)+1e-9)*100
-                    
-                    w_df=pd.DataFrame({'Faktör':w_names,'Etki (%)':w_norm})
-                    w_df=w_df.sort_values(by='Etki (%)', ascending=False)
+                    w_df=pd.DataFrame({'Faktör':w_names,'Etki (%)':w_norm}).sort_values(by='Etki (%)', ascending=False)
                     
                     c1,c2=st.columns([1,2])
                     with c1:
-                        st.markdown(f"### Karar: **{dec}**"); st.caption(f"Seçilen Zaman Dilimi: {tf}"); st.markdown(f"**Senin Puanın:** {info['my_score']:.2f}"); st.markdown("**Model Etki Dağılımı:**")
+                        st.markdown(f"### Karar: **{dec}**"); st.caption(f"Zaman Dilimi: {tf}")
                         st.dataframe(w_df, hide_index=True)
                     with c2:
-                        fig=go.Figure(); fig.add_trace(go.Scatter(x=info['dates'],y=info['bot_eq'],name="Bot",line=dict(color='green',width=2)))
+                        fig=go.Figure()
+                        fig.add_trace(go.Scatter(x=info['dates'],y=info['bot_eq'],name="Bot",line=dict(color='green',width=2)))
                         fig.add_trace(go.Scatter(x=info['dates'],y=info['hodl_eq'],name="HODL",line=dict(color='gray',dash='dot')))
-                        color_ti="green" if info['alpha']>0 else "red"
-                        fig.update_layout(title=f"Kazanan Strateji ({tf}) ROI: %{info['bot_roi']:.2f}",title_font_color=color_ti,height=250,template="plotly_dark",margin=dict(t=30,b=0,l=0,r=0))
                         st.plotly_chart(fig, use_container_width=True)
                     
-                    stt=row['Durum']
-                    if stt=='COIN' and dec=='SAT':
-                        amt=float(row['Miktar'])
-                        if amt>0: updated.at[idx,'Durum']='CASH'; updated.at[idx,'Nakit_Bakiye_USD']=amt*prc; updated.at[idx,'Miktar']=0.0; updated.at[idx,'Son_Islem_Fiyati']=prc; updated.at[idx,'Son_Islem_Log']=f"SAT ({tf}) R:{info['bot_roi']:.1f}"; updated.at[idx,'Son_Islem_Zamani']=time_str
-                    elif stt=='CASH' and dec=='AL':
-                        cash=float(row['Nakit_Bakiye_USD'])
-                        if cash>1: updated.at[idx,'Durum']='COIN'; updated.at[idx,'Miktar']=cash/prc; updated.at[idx,'Nakit_Bakiye_USD']=0.0; updated.at[idx,'Son_Islem_Fiyati']=prc; updated.at[idx,'Son_Islem_Log']=f"AL ({tf}) R:{info['bot_roi']:.1f}"; updated.at[idx,'Son_Islem_Zamani']=time_str
-                        
-                    val=(float(updated.at[idx,'Miktar'])*prc) if updated.at[idx,'Durum']=='COIN' else float(updated.at[idx,'Nakit_Bakiye_USD'])
-                    updated.at[idx,'Kaydedilen_Deger_USD']=val
-                    ph.success(f"Analiz Bitti. En iyi grafik: {tf}")
-                    
+                    ph.success(f"Analiz Bitti. ROI: %{info['bot_roi']:.2f}")
             prog.progress((i+1)/len(updated))
-            
+        
+        # --- ORTAK KASA MANTIĞI ---
+        
+        # 2. Satış İşlemleri
+        for s in signals:
+            if s['status'] == 'COIN' and s['signal'] == -1: # SAT
+                revenue = s['amount'] * s['price']
+                total_cash_pool += revenue
+                updated.at[s['idx'], 'Durum'] = 'CASH'
+                updated.at[s['idx'], 'Miktar'] = 0.0
+                updated.at[s['idx'], 'Nakit_Bakiye_USD'] = 0.0
+                updated.at[s['idx'], 'Son_Islem_Fiyati'] = s['price']
+                updated.at[s['idx'], 'Son_Islem_Log'] = f"SAT ({s['tf']}) Havuza Aktarıldı"
+                updated.at[s['idx'], 'Son_Islem_Zamani'] = time_str
+                st.toast(f"🔻 SATILDI: {s['ticker']} -> +${revenue:.2f} Havuza Eklendi.")
+
+        # 3. Alım İşlemleri (Winner Takes All)
+        buy_candidates = [s for s in signals if s['signal'] == 1]
+        buy_candidates.sort(key=lambda x: x['roi'], reverse=True)
+        
+        if buy_candidates and total_cash_pool > 1.0:
+            winner = buy_candidates[0]
+            if updated.at[winner['idx'], 'Durum'] == 'CASH':
+                amount_to_buy = total_cash_pool / winner['price']
+                updated.at[winner['idx'], 'Durum'] = 'COIN'
+                updated.at[winner['idx'], 'Miktar'] = amount_to_buy
+                updated.at[winner['idx'], 'Nakit_Bakiye_USD'] = 0.0
+                updated.at[winner['idx'], 'Son_Islem_Fiyati'] = winner['price']
+                updated.at[winner['idx'], 'Son_Islem_Log'] = f"AL ({winner['tf']}) Lider"
+                updated.at[winner['idx'], 'Son_Islem_Zamani'] = time_str
+                
+                # Diğerlerinin nakdini sıfırla (Para winner'a gitti)
+                for idx in updated.index:
+                    if idx != winner['idx'] and updated.at[idx, 'Durum'] == 'CASH':
+                        updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0
+                
+                st.toast(f"🚀 ALINDI: {winner['ticker']} (ROI: {winner['roi']:.1f}%) - ${total_cash_pool:.2f}")
+        
+        elif total_cash_pool > 0:
+             # Hiçbir şey alınmazsa parayı park et
+             first_idx = updated.index[0]
+             current_parked = float(updated.at[first_idx, 'Nakit_Bakiye_USD'])
+             updated.at[first_idx, 'Nakit_Bakiye_USD'] = current_parked + total_cash_pool
+             for idx in updated.index:
+                 if idx != first_idx and updated.at[idx, 'Durum'] == 'CASH':
+                     updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0
+             st.info(f"⏸️ İşlem Yok. ${total_cash_pool:.2f} Nakitte Bekliyor.")
+
+        # Değer Güncelleme
+        for idx, row in updated.iterrows():
+             # Anlık fiyatı tekrar çekmek yerine sinyalden alalım (Hız için)
+             # Ancak en doğrusu tekrar çekmektir, burada basitlik için sinyalden alıyoruz
+             price = next((s['price'] for s in signals if s['idx'] == idx), 0.0)
+             if price > 0:
+                 if updated.at[idx, 'Durum'] == 'COIN':
+                     val = float(updated.at[idx, 'Miktar']) * price
+                 else:
+                     val = float(updated.at[idx, 'Nakit_Bakiye_USD'])
+                 updated.at[idx, 'Kaydedilen_Deger_USD'] = val
+
         save_portfolio(updated, sheet)
         
-        # Genel Performans Özeti
-        st.divider(); st.subheader("🏆 Turnuva Sonuçları & Performans")
+        st.divider(); st.subheader("🏆 Turnuva Sonuçları")
         if sim_summary:
             sum_df=pd.DataFrame(sim_summary)
-            col1,col2,col3=st.columns(3)
-            col1.metric("Ort. Bot Getirisi", f"%{sum_df['Bot ROI'].mean():.2f}")
-            col2.metric("Ort. HODL Getirisi", f"%{sum_df['HODL ROI'].mean():.2f}")
-            col3.metric("TOPLAM ALPHA", f"%{sum_df['Alpha'].mean():.2f}", delta_color="normal")
             st.dataframe(sum_df.style.format("{:.2f}", subset=["Bot ROI","HODL ROI","Alpha"]))
             
         st.success("✅ Canavar Motor Tamamlandı!")
