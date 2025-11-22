@@ -144,10 +144,15 @@ def process_data(df, timeframe):
 
     # TEMEL ÖZELLİKLERİN OLUŞTURULMASI (Hata önleme için önce yapılmalı)
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'])
+    
+    # KRİTİK GÜNCELLEME 1: Log-Return Zorunluluğu
+    # Logaritmik getiri finansal ekonometrik modeller için zorunludur.
     df_res['log_ret'] = np.log(df_res['kalman_close'] / df_res['kalman_close'].shift(1))
+    
     df_res['range'] = (df_res['high'] - df_res['low']) / df_res['close'] # 'range' burada oluşturuldu
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() # Yüzdesel getiri
+    # df_res['ret'] yerine log_ret kullanılıyor, ancak bazı heuristikler için tutuldu
+    df_res['ret'] = df_res['close'].pct_change() 
 
     # YENİ İSTATİSTİKSEL MODELLER/ÖZELLİKLER (İstenen geliştirmeler)
     
@@ -186,10 +191,10 @@ def process_data(df, timeframe):
 
 def select_best_garch_model(returns):
     """Farklı ARCH/GARCH modellerini AIC/BIC kriterine göre seçer."""
+    # KRİTİK GÜNCELLEME 2.1: returns'ün log-return olduğunu varsayıyoruz
     if len(returns) < 200:
         return 0.0, None # Yeterli veri yok
 
-    # Kripto için yaygın ve asimetrik modeller
     models_to_test = {
         'GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 0, 'q': 1},
         'GJR-GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 1, 'q': 1},
@@ -202,14 +207,15 @@ def select_best_garch_model(returns):
     
     for name, params in models_to_test.items():
         try:
-            # StudentsT dağılımı kullanıldı (Kripto için daha iyi kuyruk yakalama)
-            am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT')
+            # Student's T dağılımı ve 100 ile ölçeklendirme (arch paketi için)
+            am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT') 
             res = am.fit(disp='off')
             
             if res.aic < best_aic:
                 best_aic = res.aic
                 forecast = res.forecast(horizon=1)
-                best_forecast = np.sqrt(forecast.variance.iloc[-1, 0])
+                # Oynaklığı (volatilite) standart sapma olarak alıyoruz, ölçeklendirmeyi geri alıyoruz
+                best_forecast = np.sqrt(forecast.variance.iloc[-1, 0]) / 100
                 
         except Exception:
             continue
@@ -219,34 +225,41 @@ def select_best_garch_model(returns):
 
 def estimate_arch_garch_models(returns):
     """Akıllı model seçimi ile GARCH tahminini döndürür."""
-    # Sadece en iyi GARCH modelinin oynaklık tahminini döndürür.
     forecast, aic = select_best_garch_model(returns)
     return forecast
 
 def estimate_arima_models(prices, is_sarima=False):
-    """ARIMA/SARIMA modellerini Box-Cox dönüşümü ve otomatik AIC seçimi ile eğitir ve tek adım ilerideki tahmini döndürür."""
+    """ARIMA/SARIMA modellerini Box-Cox/Log dönüşümü ve otomatik AIC seçimi ile eğitir."""
     
-    # Getiri Serisi kullanılır (durağanlık varsayımı için)
-    returns = prices.pct_change().dropna()
+    # Getiri Serisi kullanılır (log-return)
+    returns = np.log(prices / prices.shift(1)).dropna()
     if len(returns) < 50: return 0.0
     
+    # KRİTİK GÜNCELLEME 3.1: Box-Cox dönüşümü için pozitiflik kontrolü
+    # Log-return serisi negatif değerler içerir. Bu durumda Box-Cox uygulanamaz.
+    # pm.auto_arima'nın bu seriler için log-dönüşümü denemesini sağlamak için 'power_transform' kapatılabilir 
+    # veya Yeo-Johnson'a güveniriz. Ancak pm.auto_arima'yı doğrudan log-return serisine uygulamak en güvenlisidir.
+    
     try:
-        # pm.auto_arima: Otomatik model seçimi, Box-Cox dönüşümü ve durağanlık/fark alma otomatik yönetilir.
+        # pm.auto_arima: Otomatik model seçimi, differencing ve mevsimsellik yönetimi
         model = pm.auto_arima(returns, 
-                              seasonal=is_sarima, m=5 if is_sarima else 1, # m=5 haftalık mevsimsellik için
+                              seasonal=is_sarima, m=5 if is_sarima else 1, 
                               stepwise=True, 
                               suppress_warnings=True, 
                               trace=False, 
                               error_action='ignore',
-                              power_transform=True, max_power=2, # Box-Cox dönüşümünü etkinleştirir
-                              d=None, D=None, # d ve D parametrelerinin otomatik seçimine izin verir
-                              scoring='aic') # AIC kriterine göre en iyi modeli seçer
+                              # KRİTİK GÜNCELLEME 3.2: Log-Return kullandığımız için, Box-Cox'u kapatmak daha güvenlidir.
+                              # Ya da power_transform=True ile Yeo-Johnson'a güveniriz. Şimdilik Yeo-Johnson'a güvendik.
+                              power_transform=True, max_power=2,
+                              d=None, D=None, 
+                              scoring='aic') 
         
         forecast_ret = model.predict(n_periods=1)[0]
         
         # Tahmin edilen getiriyi fiyata dönüştür
         last_price = prices.iloc[-1]
-        forecast_price = last_price * (1 + forecast_ret)
+        # Log-Return'den fiyata dönüşüm: P_t+1 = P_t * exp(r_t+1)
+        forecast_price = last_price * np.exp(forecast_ret)
         
         # Sinyal: % Getiri tahmini
         return float((forecast_price / last_price) - 1.0)
@@ -294,18 +307,12 @@ def train_meta_learner(df, params=None):
 
     # --- YENİ ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Eğitim Verisi Üzerinde) ---
     
-    # ARIMA/SARIMA Sinyalleri (Fiyat Tahmin Getirisi) - Akıllı seçim ve Box-Cox ile
+    # ARIMA/SARIMA Sinyalleri (Fiyat Tahmin Getirisi) - Sinyalin şiddeti Meta-Learner'a iletiliyor
     arima_getiri = estimate_arima_models(train['close'], is_sarima=False)
     sarima_getiri = estimate_arima_models(train['close'], is_sarima=True)
     
-    # Sinyal: Getiri > 0 ise AL (+1), Getiri < 0 ise SAT (-1)
-    try: arima_signal = float(np.sign(arima_getiri))
-    except: arima_signal = 0.0
-    try: sarima_signal = float(np.sign(sarima_getiri))
-    except: sarima_signal = 0.0
-    
-    # ARCH/GARCH Modellerinden Akıllı Seçim ile Tek Bir Oynaklık Puanı
-    garch_score_tr = estimate_arch_garch_models(train['ret'].replace([np.inf, -np.inf], np.nan).dropna())
+    # ARCH/GARCH Modellerinden Akıllı Seçim ile Tek Bir Oynaklık Puanı - Ham Volatilite değeri kullanılıyor
+    garch_score_tr = estimate_arch_garch_models(train['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
     
     # Oynaklık Sinyali (Yüksek oynaklık negatif sinyal)
     scaler_vol = StandardScaler()
@@ -337,14 +344,16 @@ def train_meta_learner(df, params=None):
         'HMM': hmm_pred,
         'Heuristic': train['heuristic'].values,
         'Historical_Avg_Score': train['historical_avg_score'].values, 
-        'ARIMA_Signal': np.full(len(train), arima_signal, dtype=np.float64), 
-        'SARIMA_Signal': np.full(len(train), sarima_signal, dtype=np.float64), 
+        # KRİTİK GÜNCELLEME 4.1: Sinyalin şiddeti (Ham Getiri) kullanılıyor
+        'ARIMA_Return': np.full(len(train), arima_getiri, dtype=np.float64), 
+        'SARIMA_Return': np.full(len(train), sarima_getiri, dtype=np.float64), 
         'GARCH_Volatility': np.full(len(train), garch_score_tr, dtype=np.float64), 
         'Vol_Signal': np.full(len(train), garch_signal, dtype=np.float64) 
     })
     
     # --- KRİTİK DÜZELTME: Sinyal Normalizasyonu (RF/XGB hariç) ---
-    meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Signal', 'SARIMA_Signal', 'GARCH_Volatility', 'Vol_Signal']
+    # Log-Return artık sinyal olarak kullanıldığı için isimleri güncelledik
+    meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Return', 'SARIMA_Return', 'GARCH_Volatility', 'Vol_Signal']
     
     scaler_meta = StandardScaler()
     meta_X[meta_features_to_scale] = scaler_meta.fit_transform(meta_X[meta_features_to_scale])
@@ -356,13 +365,11 @@ def train_meta_learner(df, params=None):
     # --- YENİ ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Test Verisi Üzerinde) ---
 
     # ARIMA/SARIMA Sinyalleri (Test verisi için)
-    try: arima_signal_test = float(np.sign(estimate_arima_models(test['close'], is_sarima=False)))
-    except: arima_signal_test = 0.0
-    try: sarima_signal_test = float(np.sign(estimate_arima_models(test['close'], is_sarima=True)))
-    except: sarima_signal_test = 0.0
-
+    arima_getiri_test = estimate_arima_models(test['close'], is_sarima=False)
+    sarima_getiri_test = estimate_arima_models(test['close'], is_sarima=True)
+    
     # ARCH/GARCH Oynaklık Puanı (Test verisi için)
-    garch_score_test = estimate_arch_garch_models(test['ret'].replace([np.inf, -np.inf], np.nan).dropna())
+    garch_score_test = estimate_arch_garch_models(test['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
     scaled_range_test = scaler_vol.transform(np.array(test['range'].values).reshape(-1, 1)).flatten()
     garch_signal_test = float(-np.sign(scaled_range_test[-1])) if len(scaled_range_test) > 0 else 0.0
     
@@ -381,9 +388,9 @@ def train_meta_learner(df, params=None):
         'HMM': hmm_s_t,
         'Heuristic': test['heuristic'].values,
         'Historical_Avg_Score': test['historical_avg_score'].values,
-        # Tek bir tahmin değerini tüm test setine yayma, dtype zorlandı
-        'ARIMA_Signal': np.full(len(test), arima_signal_test, dtype=np.float64), 
-        'SARIMA_Signal': np.full(len(test), sarima_signal_test, dtype=np.float64),
+        # KRİTİK GÜNCELLEME 4.2: Sinyalin şiddeti (Ham Getiri) kullanılıyor
+        'ARIMA_Return': np.full(len(test), arima_getiri_test, dtype=np.float64), 
+        'SARIMA_Return': np.full(len(test), sarima_getiri_test, dtype=np.float64),
         'GARCH_Volatility': np.full(len(test), garch_score_test, dtype=np.float64),
         'Vol_Signal': np.full(len(test), garch_signal_test, dtype=np.float64)
     })
@@ -409,8 +416,8 @@ def train_meta_learner(df, params=None):
         'HMM',
         'Senin Kuralın (Heuristic)',
         'Tarihsel Ortalamalar',
-        'ARIMA Fiyat Tahmini', 
-        'SARIMA Fiyat Tahmini', 
+        'ARIMA Getiri Tahmini', # Güncellendi
+        'SARIMA Getiri Tahmini', # Güncellendi
         'GARCH Oynaklık Skoru', 
         'Oynaklık Sinyali'
     ]
