@@ -20,10 +20,10 @@ from scipy.stats import boxcox, yeojohnson # Dönüşümler için
 
 # --- AI & ML Kütüphaneleri ---
 from hmmlearn.hmm import GaussianHMM
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier # Yeni ML Modeli
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPRegressor # KRİTİK EKLEME: NNAR (Doğrusal Olmayan Zaman Serisi) için
+from sklearn.neural_network import MLPRegressor # NNAR (Yapay Sinir Ağı) için
 import xgboost as xgb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -198,7 +198,7 @@ def select_best_garch_model(returns):
     models_to_test = {
         'GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 0, 'q': 1},
         'GJR-GARCH(1,1)': {'vol': 'GARCH', 'p': 1, 'o': 1, 'q': 1},
-        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1}
+        'APARCH(1,1)': {'vol': 'APARCH', 'p': 1, 'o': 1, 'q': 1} 
     }
     
     best_aic = np.inf
@@ -238,7 +238,6 @@ def estimate_arima_models(prices, is_sarima=False):
     if len(returns) < 50: return 0.0
     
     try:
-        # pm.auto_arima: Otomatik model seçimi, Yeo-Johnson dönüşümü (negatif değerler için daha güvenli)
         model = pm.auto_arima(returns, 
                               seasonal=is_sarima, m=5 if is_sarima else 1, 
                               stepwise=True, 
@@ -259,7 +258,7 @@ def estimate_arima_models(prices, is_sarima=False):
         
         forecast_ret = model.predict(n_periods=1)[0]
         
-        # Log-Return'den fiyata dönüşüm: P_t+1 = P_t * exp(r_t+1)
+        # Log-Return'den fiyata dönüşüm
         last_price = prices.iloc[-1]
         forecast_price = last_price * np.exp(forecast_ret)
         
@@ -298,9 +297,9 @@ def estimate_nnar_models(returns):
 
 
 def ga_optimize(df, n_gen=5):
-    """Genetic Algoritma ile basit RF modelini optimize eder."""
+    """Genetic Algoritma ile basit RF/ExtraTrees modelini optimize eder."""
     best_depth = 5; best_nest = 50; best_score = -999
-    # Yeni özellik setini RF optimizasyonuna dahil et
+    
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     
     for d in [3, 5, 7, 9]:
@@ -308,57 +307,71 @@ def ga_optimize(df, n_gen=5):
             train = df.iloc[:-30]; test = df.iloc[-30:]
             current_features = [f for f in features if f in train.columns]
             
-            # Veri kümesinin boş olmamasını veya özelliklerin mevcut olmasını sağla
             if not current_features or train.empty: continue
 
-            rf = RandomForestClassifier(n_estimators=n, max_depth=d).fit(train[current_features], train['target'])
-            score = rf.score(test[current_features], test['target'])
-            if score > best_score:
-                best_score = score; best_depth = d; best_nest = n
-    return {'rf_depth': best_depth, 'rf_nest': best_nest, 'xgb_params': {'max_depth':3, 'n_estimators':50}}
+            # İKİ FARKLI ML MODELİNİN PERFORMANSI KIYASLANIYOR
+            
+            # 1. RandomForest
+            rf = RandomForestClassifier(n_estimators=n, max_depth=d, random_state=42).fit(train[current_features], train['target'])
+            score_rf = rf.score(test[current_features], test['target'])
+            
+            if score_rf > best_score:
+                best_score = score_rf
+                best_depth = d
+                best_nest = n
+                
+            # 2. ExtraTreesClassifier (Daha rastgele ve agresif)
+            etc = ExtraTreesClassifier(n_estimators=n, max_depth=d, random_state=42).fit(train[current_features], train['target'])
+            score_etc = etc.score(test[current_features], test['target'])
+
+            if score_etc > best_score:
+                best_score = score_etc
+                best_depth = d
+                best_nest = n
+                
+    return {'rf_depth': best_depth, 'rf_nest': best_nest, 'xgb_params': {'max_depth':5, 'n_estimators':100}} # Sabit yüksek ayarlar kullanılıyor
 
 
 def train_meta_learner(df, params=None):
     """Ana modelleri eğitir ve Lojistik Regresyon ile birleştirir (Meta-Learner)."""
+    # ML Model Parametreleri
     rf_d = params['rf_depth'] if params else 5
     rf_n = params['rf_nest'] if params else 50
+    xgb_d = params['xgb_params']['max_depth']
+    xgb_n = params['xgb_params']['n_estimators']
     test_size = 60
     
     if len(df) < test_size + 50: return 0.0, None
     train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
     
-    # Tüm base modeller için GENİŞLETİLMİŞ özellik seti
+    # Özellik seti
     base_features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     X_tr = train[base_features]; y_tr = train['target']
     X_test = test[base_features]
 
-    # Model eğitiminden önce X_tr ve y_tr'nin boş olmadığından emin ol
     if X_tr.empty or y_tr.empty: return 0.0, None
 
-    # --- YENİ ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Eğitim Verisi Üzerinde) ---
+    # --- ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Eğitim Verisi Üzerinde) ---
     
-    # ARIMA/SARIMA Sinyalleri (Fiyat Tahmin Getirisi) - Sinyalin şiddeti Meta-Learner'a iletiliyor
     arima_getiri = estimate_arima_models(train['close'], is_sarima=False)
     sarima_getiri = estimate_arima_models(train['close'], is_sarima=True)
-    
-    # NNAR Sinyali
     nnar_getiri = estimate_nnar_models(train['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
-    
-    # ARCH/GARCH Modellerinden Akıllı Seçim ile Tek Bir Oynaklık Puanı - Ham Volatilite değeri kullanılıyor
     garch_score_tr = estimate_arch_garch_models(train['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
     
-    # Oynaklık Sinyali (Yüksek oynaklık negatif sinyal)
+    # Oynaklık Sinyali (Range Scaler'ı, Meta-Learner dışı özellik için)
     scaler_vol = StandardScaler()
     scaled_range_tr = scaler_vol.fit_transform(np.array(train['range'].values).reshape(-1, 1)).flatten()
-    # Sinyali sadece son değerden türet
     garch_signal = float(-np.sign(scaled_range_tr[-1])) if len(scaled_range_tr) > 0 else 0.0 
 
-    # 1. RandomForest, 2. XGBoost eğitimi
+    # 1. Random Forest (RF)
     rf = RandomForestClassifier(n_estimators=rf_n, max_depth=rf_d, random_state=42).fit(X_tr, y_tr)
-    xgb_c = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=50, max_depth=3).fit(X_tr, y_tr)
+    # 2. Extra Trees Classifier (ETC) - Yeni Model
+    etc = ExtraTreesClassifier(n_estimators=rf_n, max_depth=rf_d, random_state=42).fit(X_tr, y_tr)
+    # 3. XGBoost
+    xgb_c = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=xgb_n, max_depth=xgb_d).fit(X_tr, y_tr)
     
-    # 3. HMM eğitimi
-    scaler_hmm = StandardScaler() # Yeni scaler oluşturuldu
+    # 4. HMM eğitimi
+    scaler_hmm = StandardScaler()
     X_hmm = scaler_hmm.fit_transform(train[['log_ret', 'range_vol_delta']])
     hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50, random_state=42)
     try: hmm.fit(X_hmm)
@@ -367,71 +380,71 @@ def train_meta_learner(df, params=None):
     hmm_pred = np.zeros(len(train))
     if hmm:
         pr = hmm.predict_proba(X_hmm)
-        bull = np.argmax(hmm.means_[:,0]); bear = np.argmin(hmm.means_[:,0])
-        hmm_pred = pr[:, bull] - pr[:, bear]
+        # HMM'in tüm rejim olasılıklarını sinyal olarak kullan (Rejim 0, Rejim 1, Rejim 2)
+        hmm_prob_df = pd.DataFrame(pr, columns=[f'HMM_R{i}' for i in range(pr.shape[1])], index=train.index)
+    else:
+        hmm_prob_df = pd.DataFrame(np.zeros((len(train), 3)), columns=[f'HMM_R{i}' for i in range(3)], index=train.index)
         
     # Meta Öğreniciye Girdiler
     meta_X = pd.DataFrame({
         'RF': rf.predict_proba(X_tr)[:,1],
+        'ETC': etc.predict_proba(X_tr)[:,1], # YENİ SİNYAL: ETC Olasılığı
         'XGB': xgb_c.predict_proba(X_tr)[:,1],
-        'HMM': hmm_pred,
         'Heuristic': train['heuristic'].values,
         'Historical_Avg_Score': train['historical_avg_score'].values, 
-        # KRİTİK GÜNCELLEME: Sinyalin şiddeti (Ham Getiri) kullanılıyor
         'ARIMA_Return': np.full(len(train), arima_getiri, dtype=np.float64), 
         'SARIMA_Return': np.full(len(train), sarima_getiri, dtype=np.float64), 
-        'NNAR_Return': np.full(len(train), nnar_getiri, dtype=np.float64), # YENİ SİNYAL
+        'NNAR_Return': np.full(len(train), nnar_getiri, dtype=np.float64), 
         'GARCH_Volatility': np.full(len(train), garch_score_tr, dtype=np.float64), 
         'Vol_Signal': np.full(len(train), garch_signal, dtype=np.float64) 
     })
     
-    # --- KRİTİK DÜZELTME: Sinyal Normalizasyonu (RF/XGB hariç) ---
-    meta_features_to_scale = ['HMM', 'Heuristic', 'Historical_Avg_Score', 'ARIMA_Return', 'SARIMA_Return', 'NNAR_Return', 'GARCH_Volatility', 'Vol_Signal']
+    # HMM Rejim Olasılıklarını Ekleme
+    meta_X = pd.concat([meta_X, hmm_prob_df.iloc[:len(meta_X)]], axis=1)
+
+    # --- KRİTİK DÜZELTME: Sinyal Normalizasyonu (ML Modelleri hariç) ---
+    meta_features_to_scale = [
+        'Heuristic', 'Historical_Avg_Score', 'ARIMA_Return', 'SARIMA_Return', 
+        'NNAR_Return', 'GARCH_Volatility', 'Vol_Signal', 'HMM_R0', 'HMM_R1', 'HMM_R2' # Yeni HMM ve NNAR Sinyalleri
+    ]
     
     scaler_meta = StandardScaler()
     meta_X[meta_features_to_scale] = scaler_meta.fit_transform(meta_X[meta_features_to_scale])
 
     # --- KRİTİK DÜZELTME: Düzenlileştirme ile Logistic Regression eğitimi ---
-    meta_model = LogisticRegression(C=0.1, solver='liblinear').fit(meta_X, y_tr)
+    meta_model = LogisticRegression(C=0.1, solver='liblinear', penalty='l2').fit(meta_X, y_tr)
     weights = meta_model.coef_[0]
     
-    # --- YENİ ZAMAN SERİSİ VE OYNAKLIK MODELLERİ ÇIKTILARI (Test Verisi Üzerinde) ---
+    # --- TEST VERİSİ ÜZERİNDE TAHMİN (TEST Verisi Üzerinde) ---
 
-    # ARIMA/SARIMA Sinyalleri (Test verisi için)
     arima_getiri_test = estimate_arima_models(test['close'], is_sarima=False)
     sarima_getiri_test = estimate_arima_models(test['close'], is_sarima=True)
-    
-    # NNAR Sinyali (Test verisi için)
     nnar_getiri_test = estimate_nnar_models(test['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
-    
-    # ARCH/GARCH Oynaklık Puanı (Test verisi için)
     garch_score_test = estimate_arch_garch_models(test['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
     scaled_range_test = scaler_vol.transform(np.array(test['range'].values).reshape(-1, 1)).flatten()
     garch_signal_test = float(-np.sign(scaled_range_test[-1])) if len(scaled_range_test) > 0 else 0.0
     
-    # Simülasyon
-    sim_eq=[100]; hodl_eq=[100]; cash=100; coin=0; p0=test['close'].iloc[0]
-    
     # Test verisi için HMM tahminleri
     X_hmm_t = scaler_hmm.transform(test[['log_ret','range_vol_delta']])
     hmm_p_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
-    hmm_s_t = hmm_p_t[:, np.argmax(hmm.means_[:,0])] - hmm_p_t[:, np.argmin(hmm.means_[:,0])] if hmm else np.zeros(len(test))
+    hmm_prob_df_test = pd.DataFrame(hmm_p_t, columns=[f'HMM_R{i}' for i in range(hmm_p_t.shape[1])], index=test.index)
     
     # Test verisi için Meta Öğrenici Girdileri
     mx_test = pd.DataFrame({
         'RF': rf.predict_proba(X_test)[:,1],
+        'ETC': etc.predict_proba(X_test)[:,1], # YENİ SİNYAL: ETC Olasılığı
         'XGB': xgb_c.predict_proba(X_test)[:,1],
-        'HMM': hmm_s_t,
         'Heuristic': test['heuristic'].values,
         'Historical_Avg_Score': test['historical_avg_score'].values,
-        # KRİTİK GÜNCELLEME 4.2: Sinyalin şiddeti (Ham Getiri) kullanılıyor
         'ARIMA_Return': np.full(len(test), arima_getiri_test, dtype=np.float64), 
         'SARIMA_Return': np.full(len(test), sarima_getiri_test, dtype=np.float64),
-        'NNAR_Return': np.full(len(test), nnar_getiri_test, dtype=np.float64), # YENİ SİNYAL
+        'NNAR_Return': np.full(len(test), nnar_getiri_test, dtype=np.float64), 
         'GARCH_Volatility': np.full(len(test), garch_score_test, dtype=np.float64),
         'Vol_Signal': np.full(len(test), garch_signal_test, dtype=np.float64)
     })
     
+    mx_test = pd.concat([mx_test, hmm_prob_df_test.iloc[:len(mx_test)]], axis=1)
+
     # Test verisine Normalizasyon uygulama
     mx_test[meta_features_to_scale] = scaler_meta.transform(mx_test[meta_features_to_scale])
 
@@ -448,16 +461,12 @@ def train_meta_learner(df, params=None):
     
     # GÜNCELLENMİŞ Model Etki İsimleri (Streamlit için)
     weights_names = [
-        'RandomForest',
-        'XGBoost',
-        'HMM',
-        'Senin Kuralın (Heuristic)',
-        'Tarihsel Ortalamalar',
-        'ARIMA Getiri Tahmini', 
-        'SARIMA Getiri Tahmini', 
-        'NNAR Getiri Tahmini', # YENİ SİNYAL
-        'GARCH Oynaklık Skoru', 
-        'Oynaklık Sinyali'
+        'RandomForest', 'ExtraTrees', 'XGBoost', 
+        'Senin Kuralın (Heuristic)', 'Tarihsel Ortalamalar',
+        'ARIMA Getiri Tahmini', 'SARIMA Getiri Tahmini', 
+        'NNAR Getiri Tahmini', 'GARCH Oynaklık Skoru', 
+        'Oynaklık Sinyali', 
+        'HMM Rejim 0', 'HMM Rejim 1', 'HMM Rejim 2' # Yeni HMM Rejimleri
     ]
     
     # Hata ihtimali olan yerlerde float kontrolü yapıldı
