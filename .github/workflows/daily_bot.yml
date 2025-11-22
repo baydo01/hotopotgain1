@@ -2,10 +2,10 @@ name: Hedge Fund Bot Runner
 
 on:
   schedule:
-    # Her 4 saatte bir çalıştır (UTC saatine göre)
-    # İstediğin sıklığa göre değiştirebilirsin. "0 * * * *" her saat başı demektir.
-    - cron: '0 */4 * * *' 
-  workflow_dispatch: # Manuel tetikleme için buton ekler
+    # Her saat başı çalıştır (UTC saatine göre)
+    # "0 * * * *" -> Her saatin 0. dakikasında çalış demektir.
+    - cron: '0 * * * *' 
+  workflow_dispatch: # GitHub üzerinden manuel "Run" butonu ekler
 
 jobs:
   build:
@@ -30,4 +30,4 @@ jobs:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: |
-          python bot_engine.py
+          python bot.py
