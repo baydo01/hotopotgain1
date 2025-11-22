@@ -23,7 +23,7 @@ from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPRegressor
+from sklearn.neural_network import MLPRegressor 
 import xgboost as xgb
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -40,7 +40,7 @@ st.title("🏦 Hedge Fund AI: Canavar Motor")
 SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
 CREDENTIALS_FILE = "service_account.json"
 TARGET_COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD"]
-DATA_PERIOD = "3y"
+DATA_PERIOD = "3y" 
 
 with st.sidebar:
     st.header("⚙️ Ayarlar")
@@ -189,7 +189,6 @@ def select_best_garch_model(returns):
             am = arch_model(100 * returns, vol=params['vol'], p=params['p'], o=params['o'], q=params['q'], dist='StudentsT')
             res = am.fit(disp='off')
             
-            # Kalıntı Analizi (Ljung-Box)
             lb_p = acorr_ljungbox(res.resid**2, lags=[10], return_df=True)['lb_pvalue'].iloc[-1]
             
             if res.aic < best_aic and lb_p > 0.05:
@@ -297,6 +296,7 @@ def train_meta_learner(df, params=None):
         pr = hmm.predict_proba(X_hmm)
         hmm_prob_df = pd.DataFrame(pr, columns=[f'HMM_R{i}' for i in range(pr.shape[1])], index=train.index)
         
+    # META_X OLUŞTURMA (INDEX EŞLEŞTİRME İLE)
     meta_X = pd.DataFrame({
         'RF': rf.predict_proba(X_tr)[:,1],
         'ETC': etc.predict_proba(X_tr)[:,1],
@@ -308,11 +308,10 @@ def train_meta_learner(df, params=None):
         'NNAR_Return': np.full(len(train), nnar_getiri, dtype=np.float64), 
         'GARCH_Volatility': np.full(len(train), garch_score_tr, dtype=np.float64), 
         'Vol_Signal': np.full(len(train), garch_signal, dtype=np.float64) 
-    })
+    }, index=train.index) # <--- INDEX EKLENDİ
     
-    meta_X = pd.concat([meta_X, hmm_prob_df.iloc[:len(meta_X)]], axis=1)
+    meta_X = pd.concat([meta_X, hmm_prob_df], axis=1)
 
-    # --- GÜVENLİK VE TEMİZLİK KATMANI ---
     meta_X = meta_X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     meta_features_to_scale = [
@@ -320,13 +319,11 @@ def train_meta_learner(df, params=None):
         'NNAR_Return', 'GARCH_Volatility', 'Vol_Signal', 'HMM_R0', 'HMM_R1', 'HMM_R2'
     ]
     
-    # Scaler hatasını önlemek için kontrol
     try:
         scaler_meta = StandardScaler()
         meta_X[meta_features_to_scale] = scaler_meta.fit_transform(meta_X[meta_features_to_scale])
-    except ValueError: pass # Boş veya sabit veri gelirse scale etme
+    except ValueError: pass
 
-    # Tekrar Temizlik (Scaler sonrası NaN oluşabilir)
     meta_X = meta_X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     meta_model = LogisticRegression(C=0.1, solver='liblinear', penalty='l2').fit(meta_X, y_tr)
@@ -355,11 +352,10 @@ def train_meta_learner(df, params=None):
         'NNAR_Return': np.full(len(test), nnar_getiri_test, dtype=np.float64), 
         'GARCH_Volatility': np.full(len(test), garch_score_test, dtype=np.float64),
         'Vol_Signal': np.full(len(test), garch_signal_test, dtype=np.float64)
-    })
+    }, index=test.index) # <--- INDEX EKLENDİ
     
-    mx_test = pd.concat([mx_test, hmm_prob_df_test.iloc[:len(mx_test)]], axis=1)
+    mx_test = pd.concat([mx_test, hmm_prob_df_test], axis=1)
     
-    # Test verisi temizliği
     mx_test = mx_test.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     try:
         mx_test[meta_features_to_scale] = scaler_meta.transform(mx_test[meta_features_to_scale])
