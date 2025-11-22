@@ -1,20 +1,3 @@
-streamlit>=1.25.0
-yfinance>=0.2.26
-pandas>=2.1.0
-numpy>=1.25.0
-gspread>=5.9.0
-oauth2client>=4.1.3
-hmmlearn>=0.3.0
-scikit-learn>=1.3.0
-xgboost>=1.7.6
-lightgbm>=4.4.0
-statsmodels>=0.14.0
-arch>=6.8.0
-deap>=1.3.3
-optuna>=3.4.0
-plotly>=5.18.0
-numba>=0.57.1
-# requirements.txt
 streamlit
 yfinance
 pandas
@@ -24,7 +7,13 @@ oauth2client
 hmmlearn
 scikit-learn
 xgboost
-plotly
+lightgbm
 statsmodels
-pmdarima      # Yeni eklendi
-arch          # Yeni eklendi
+pmdarima
+arch
+scipy
+deap
+optuna
+plotly
+numba
+pytz
