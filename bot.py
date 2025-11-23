@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() # BURASI KAYBOLMAMALI
+    df_res['ret'] = df_res['close'].pct_change() # BURASI ARTIK KORUNACAK
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -305,8 +305,13 @@ def train_meta_learner(df, params):
     probs_xgb = xgb_solo.predict_proba(X_test)[:,1]
     
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
+    
+    # KEY ERROR DÜZELTME: 'ret' sütununu garantiye al
+    if 'ret' not in test.columns:
+        test['ret'] = test['close'].pct_change().fillna(0)
+        
     for i in range(len(test)):
-        p=test['close'].iloc[i]; ret=test['ret'].iloc[i] # BURASI ARTIK HATA VERMEZ
+        p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
         
         # Trend Filtresi
         trend_up = test['trend_up'].iloc[i] == 1
@@ -314,8 +319,8 @@ def train_meta_learner(df, params):
 
         se=(probs_ens[i]-0.5)*2; sx=(probs_xgb[i]-0.5)*2
         if se>0.1: sim_ens.append(sim_ens[-1]*(1+ret))
-        elif se<sell_thresh: sim_ens.append(sim_ens[-1]) 
-        else: sim_ens.append(sim_ens[-1]) 
+        elif se<sell_thresh: sim_ens.append(sim_ens[-1]) # Sat
+        else: sim_ens.append(sim_ens[-1]) # Bekle (Trend koruması)
         
         if sx>0.1: sim_xgb.append(sim_xgb[-1]*(1+ret))
         elif sx<sell_thresh: sim_xgb.append(sim_xgb[-1])
@@ -327,14 +332,17 @@ def train_meta_learner(df, params):
     weights_dict = dict(zip(meta_X.columns, weights))
     
     if roi_xgb > roi_ens:
+        # Son sinyale trend filtresi uygula
         last_trend = test['trend_up'].iloc[-1] == 1
         sig = (probs_xgb[-1]-0.5)*2
         if last_trend and -0.3 < sig < -0.1: sig = 0.0
+        
         return sig, {'bot_roi': roi_xgb, 'method': 'Solo XGBoost', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
     else:
         last_trend = test['trend_up'].iloc[-1] == 1
         sig = (probs_ens[-1]-0.5)*2
         if last_trend and -0.3 < sig < -0.1: sig = 0.0
+        
         return sig, {'bot_roi': roi_ens, 'method': 'Ensemble', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
 
 def analyze_ticker_tournament(ticker):
@@ -373,7 +381,6 @@ if not pf_df.empty:
     total_coin = pf_df[pf_df['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
     parked = pf_df['Nakit_Bakiye_USD'].sum()
     total = total_coin + parked
-    
     c1,c2,c3 = st.columns(3)
     c1.metric("Toplam Varlık", f"${total:.2f}")
     c2.metric("Coinlerdeki Para", f"${total_coin:.2f}")
