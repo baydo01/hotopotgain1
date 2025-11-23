@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Hedge Fund AI: Mega Dashboard", layout="wide", page_icon="🏦")
-st.title("🏦 Hedge Fund AI: Mega Dashboard (Final Stable)")
+st.title("🏦 Hedge Fund AI: Mega Dashboard (Final)")
 
 # =============================================================================
 # 1. AYARLAR
@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN KORUNMALI
+    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN KORUNACAK
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -149,7 +149,7 @@ def process_data(df, timeframe):
     df_res.attrs['nan_count'] = int(nan_in_features)
     return df_res
 
-# --- SMART IMPUTATION (DÜZELTİLDİ: SÜTUN KAYBI YOK) ---
+# --- SMART IMPUTATION (HATA ÇÖZÜMÜ BURADA) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
     
@@ -173,6 +173,7 @@ def smart_impute(df, features):
                 best_score = s; best_m = name
                 
                 # KESİN ÇÖZÜM: Orijinal DF'yi kopyala ve sadece ilgili sütunları güncelle
+                # Böylece 'ret', 'close' gibi simülasyon için gerekenler SİLİNMEZ.
                 temp_df = df.copy()
                 temp_df[features] = imp.fit_transform(df[features])
                 best_df = temp_df
@@ -228,6 +229,11 @@ def train_meta_learner(df, params):
     if len(df)<150: return 0.0, None, {}
     train=df.iloc[:-test_size]; test=df.iloc[-test_size:]
     
+    # GÜVENLİK: 'ret' sütunu yoksa yeniden oluştur
+    if 'ret' not in test.columns:
+        test = test.copy()
+        test['ret'] = test['close'].pct_change().fillna(0)
+
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     X_tr = train[features].replace([np.inf, -np.inf], np.nan).fillna(0); y_tr = train['target']
     X_test = test[features].replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -306,28 +312,37 @@ def train_meta_learner(df, params):
     
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
-    # --- CAN SİMİDİ: 'ret' sütunu kontrolü ---
-    # Eğer smart_impute sırasında 'ret' silindiyse (nadiren olur), tekrar hesapla
-    if 'ret' not in test.columns:
-        test['ret'] = test['close'].pct_change().fillna(0)
-
     for i in range(len(test)):
         p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
+        
+        # Trend Filtresi
+        trend_up = test['trend_up'].iloc[i] == 1
+        sell_thresh = -0.3 if trend_up else -0.1
+
         se=(probs_ens[i]-0.5)*2; sx=(probs_xgb[i]-0.5)*2
         if se>0.1: sim_ens.append(sim_ens[-1]*(1+ret))
-        else: sim_ens.append(sim_ens[-1])
+        elif se<sell_thresh: sim_ens.append(sim_ens[-1]) 
+        else: sim_ens.append(sim_ens[-1]) 
+        
         if sx>0.1: sim_xgb.append(sim_xgb[-1]*(1+ret))
+        elif sx<sell_thresh: sim_xgb.append(sim_xgb[-1])
         else: sim_xgb.append(sim_xgb[-1])
+        
         sim_hodl.append((100/p0)*p)
         
     roi_ens = sim_ens[-1]-100; roi_xgb = sim_xgb[-1]-100
-    
     weights_dict = dict(zip(meta_X.columns, weights))
     
     if roi_xgb > roi_ens:
-        return (probs_xgb[-1]-0.5)*2, {'bot_roi': roi_xgb, 'method': 'Solo XGBoost', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
+        last_trend = test['trend_up'].iloc[-1] == 1
+        sig = (probs_xgb[-1]-0.5)*2
+        if last_trend and -0.3 < sig < -0.1: sig = 0.0
+        return sig, {'bot_roi': roi_xgb, 'method': 'Solo XGBoost', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
     else:
-        return (probs_ens[-1]-0.5)*2, {'bot_roi': roi_ens, 'method': 'Ensemble', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
+        last_trend = test['trend_up'].iloc[-1] == 1
+        sig = (probs_ens[-1]-0.5)*2
+        if last_trend and -0.3 < sig < -0.1: sig = 0.0
+        return sig, {'bot_roi': roi_ens, 'method': 'Ensemble', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
 
 def analyze_ticker_tournament(ticker):
     raw_df = get_raw_data(ticker)
@@ -341,7 +356,7 @@ def analyze_ticker_tournament(ticker):
         nan_count = df_raw.attrs.get('nan_count', 0)
         feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
         
-        # DÜZELTİLEN YER: Artık kopya aldığı için sütunlar kaybolmaz
+        # DÜZELTİLEN YER: Kopya kullanarak imputation
         df_imp, method = smart_impute(df_raw, feats)
         
         sig, info, _ = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
