@@ -25,18 +25,29 @@ import xgboost as xgb
 
 warnings.filterwarnings("ignore")
 
-SHEET_ID = os.environ.get("SHEET_ID") 
+# --- AYARLAR ---
+# GitHub Secrets'tan okunacak
+SHEET_ID = os.environ.get("SHEET_ID")
 TARGET_COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD"]
 DATA_PERIOD = "3y"
 
-# --- BAĞLANTI ---
+# =============================================================================
+# 1. BAĞLANTI VE VERİ YÖNETİMİ
+# =============================================================================
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    
+    # GitHub Secrets Ortamı
     json_creds = os.environ.get("GCP_CREDENTIALS")
+    
     creds = None
     if json_creds:
-        try: creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(json_creds), scope)
-        except Exception as e: print(e)
+        try:
+            creds_dict = json.loads(json_creds)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        except Exception as e: print(f"Secret Hatası: {e}")
+    
+    # Yerel Ortam (Test için)
     elif os.path.exists("service_account.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
     
@@ -44,7 +55,9 @@ def connect_sheet():
     try:
         client = gspread.authorize(creds)
         return client.open_by_key(SHEET_ID).sheet1
-    except: return None
+    except Exception as e:
+        print(f"Bağlantı Hatası: {e}")
+        return None
 
 def load_and_fix_portfolio():
     sheet = connect_sheet()
@@ -55,8 +68,7 @@ def load_and_fix_portfolio():
         numeric_cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
         for col in numeric_cols:
             if col in df.columns:
-                df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
         return df, sheet
     except: return pd.DataFrame(), None
 
@@ -68,7 +80,17 @@ def save_portfolio(df, sheet):
         print("✅ Google Sheets Güncellendi.")
     except Exception as e: print(f"Kayıt Hatası: {e}")
 
-# --- VERİ VE PİYASA ANALİZİ ---
+# =============================================================================
+# 2. VERİ İŞLEME VE FEATURE ENGINEERING
+# =============================================================================
+def apply_kalman_filter(prices):
+    xhat = np.zeros(len(prices)); P = np.zeros(len(prices)); xhatminus = np.zeros(len(prices)); Pminus = np.zeros(len(prices)); K = np.zeros(len(prices)); Q = 1e-5; R = 0.01**2
+    xhat[0] = prices.iloc[0]; P[0] = 1.0
+    for k in range(1, len(prices)):
+        xhatminus[k] = xhat[k-1]; Pminus[k] = P[k-1] + Q
+        K[k] = Pminus[k]/(Pminus[k]+R); xhat[k] = xhatminus[k]+K[k]*(prices.iloc[k]-xhatminus[k]); P[k] = (1-K[k])*Pminus[k]
+    return pd.Series(xhat, index=prices.index)
+
 def get_raw_data(ticker):
     try:
         df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
@@ -78,266 +100,176 @@ def get_raw_data(ticker):
         return df
     except: return None
 
-# YENİ: Global BTC Verisi (Piyasa Referansı için)
-def get_market_data():
-    try:
-        df = yf.download("BTC-USD", period=DATA_PERIOD, interval="1d", progress=False)
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df.columns = [c.lower() for c in df.columns]
-        df['btc_ret'] = np.log(df['close']/df['close'].shift(1))
-        return df[['btc_ret']]
-    except: return None
-
-def apply_kalman_filter(prices):
-    xhat = np.zeros(len(prices)); P = np.zeros(len(prices)); xhatminus = np.zeros(len(prices)); Pminus = np.zeros(len(prices)); K = np.zeros(len(prices)); Q = 1e-5; R = 0.01**2
-    xhat[0] = prices.iloc[0]; P[0] = 1.0
-    for k in range(1, len(prices)):
-        xhatminus[k] = xhat[k-1]; Pminus[k] = P[k-1] + Q
-        K[k] = Pminus[k]/(Pminus[k]+R); xhat[k] = xhatminus[k]+K[k]*(prices.iloc[k]-xhatminus[k]); P[k] = (1-K[k])*Pminus[k]
-    return pd.Series(xhat, index=prices.index)
-
-def calculate_heuristic_score(df):
-    if len(df)<150: return pd.Series(0.0, index=df.index)
-    return (np.sign(df['close'].pct_change(5)) + np.sign(df['close'].pct_change(30)))/2.0
-
-def process_data(df, timeframe, market_df):
+def process_data(df, timeframe):
     if df is None or len(df)<150: return None
     agg = {'open':'first', 'high':'max', 'low':'min', 'close':'last', 'volume':'sum'}
+    if timeframe=='W': df_res=df.resample('W').agg(agg)
+    else: df_res=df.copy()
+    if len(df_res)<60: return None
     
-    # Zaman dilimine göre örnekleme
-    if timeframe=='W': 
-        df_res = df.resample('W').agg(agg)
-        if market_df is not None: 
-            mkt_res = market_df.resample('W').sum() # Log getiriler toplanır
-    elif timeframe=='M': 
-        df_res = df.resample('ME').agg(agg)
-        if market_df is not None:
-            mkt_res = market_df.resample('ME').sum()
-    else: 
-        df_res = df.copy()
-        mkt_res = market_df.copy() if market_df is not None else None
+    # Feature Engineering
+    df_res['kalman'] = apply_kalman_filter(df_res['close'].fillna(method='ffill'))
+    df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
+    
+    # Volatilite Rejimi (ATR Bazlı)
+    hl = df_res['high'] - df_res['low']
+    tr = np.max(pd.concat([hl, np.abs(df_res['high'] - df_res['close'].shift())], axis=1), axis=1)
+    atr = tr.rolling(14).mean()
+    df_res['vol_regime'] = (atr / atr.rolling(50).mean()).fillna(1.0)
+    
+    # Basit Momentum
+    df_res['momentum'] = (np.sign(df_res['close'].diff(5)) + np.sign(df_res['close'].diff(20)))
+    
+    # Trend Filtresi için SMA
+    df_res['sma_50'] = df_res['close'].rolling(50).mean()
+    df_res['trend_up'] = (df_res['close'] > df_res['sma_50']).astype(int)
 
-    if len(df_res)<100: return None
+    # Target (Gelecek)
+    df_res['target'] = (df_res['close'].shift(-1) > df_res['close']).astype(int)
+    df_res['ret'] = df_res['close'].pct_change() # Simülasyon için
     
-    # Temel Özellikler
-    df_res['kalman_close'] = apply_kalman_filter(df_res['close'].fillna(method='ffill'))
-    df_res['log_ret'] = np.log(df_res['kalman_close']/df_res['kalman_close'].shift(1))
-    df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
-    df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change()
-    
-    df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
-    df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
-    
-    avg_feats = df_res[['avg_ret_5m','avg_ret_3y']].fillna(0)
-    df_res['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
-    
-    df_res['range_vol_delta'] = df_res['range'].pct_change(5)
-    
-    # --- YENİ: MARKET KORELASYON ÖZELLİKLERİ ---
-    if mkt_res is not None:
-        # Tarihleri eşle
-        merged = df_res.join(mkt_res, how='left').fillna(0)
-        # 30 periyotluk korelasyon (Coin vs BTC)
-        df_res['corr_btc'] = merged['log_ret'].rolling(30).corr(merged['btc_ret']).fillna(0)
-        # Göreceli Güç (Coin Getirisi - BTC Getirisi)
-        df_res['rel_strength'] = merged['log_ret'] - merged['btc_ret']
-        # Beta (Kovaryans / Varyans)
-        cov = merged['log_ret'].rolling(30).cov(merged['btc_ret'])
-        var = merged['btc_ret'].rolling(30).var()
-        df_res['beta'] = (cov / var).fillna(1.0)
-    else:
-        df_res['corr_btc'] = 0.0
-        df_res['rel_strength'] = 0.0
-        df_res['beta'] = 1.0
-
-    df_res['target'] = (df_res['close'].shift(-1)>df_res['close']).astype(int)
-    
+    # Temizlik
     df_res.replace([np.inf, -np.inf], np.nan, inplace=True)
     df_res.dropna(subset=['target'], inplace=True)
     
     return df_res
 
-# --- SMART IMPUTATION & MODELLER ---
+# --- SMART IMPUTATION (Fixed Leakage) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
-    imputers = {'KNN': KNNImputer(n_neighbors=5), 'MICE': IterativeImputer(max_iter=10, random_state=42), 'Mean': SimpleImputer(strategy='mean')}
+    imputers = {'KNN': KNNImputer(n_neighbors=5), 'Mean': SimpleImputer(strategy='mean')}
     best_score = -999; best_df = df.fillna(0); best_m = "Zero"
-    
-    val_size = 20
-    tr = df.iloc[:-val_size]; val = df.iloc[-val_size:]
-    y_tr = tr['target']; y_val = val['target']
+    tr = df.iloc[:-20]; val = df.iloc[-20:]
     
     for name, imp in imputers.items():
         try:
-            X_tr_imp = imp.fit_transform(tr[features])
-            X_val_imp = imp.transform(val[features])
-            rf = RandomForestClassifier(n_estimators=10, max_depth=3).fit(X_tr_imp, y_tr)
-            s = rf.score(X_val_imp, y_val)
-            if s > best_score:
-                best_score = s; best_m = name
+            X_tr = imp.fit_transform(tr[features]); X_val = imp.transform(val[features])
+            rf = RandomForestClassifier(n_estimators=10, max_depth=3, random_state=42).fit(X_tr, tr['target'])
+            s = rf.score(X_val, val['target'])
+            if s > best_score: 
+                best_score=s; best_m=name
                 full_imp = imp.fit_transform(df[features])
                 best_df = pd.DataFrame(full_imp, columns=features, index=df.index)
                 for c in df.columns: 
-                    if c not in features: best_df[c] = df[c]
+                    if c not in features and c != 'target': best_df[c] = df[c]
         except: continue
     return best_df, best_m
 
-def select_best_garch_model(returns):
-    returns = returns.copy()
-    if len(returns) < 200: return 0.0
-    models = {'GARCH': {'p':1,'o':0,'q':1}, 'GJR': {'p':1,'o':1,'q':1}}
-    best_aic=np.inf; best_f=0.0
-    for n, p in models.items():
-        try:
-            am = arch_model(100*returns, vol='GARCH', p=p['p'], o=p['o'], q=p['q'], dist='StudentsT')
-            res = am.fit(disp='off')
-            if res.aic < best_aic: best_aic=res.aic; best_f=np.sqrt(res.forecast(horizon=1).variance.iloc[-1,0])/100
-        except: continue
-    return float(best_forecast) if best_forecast else 0.0
-
-def estimate_arima_models(prices, is_sarima=False):
+# --- EKONOMETRİK MODELLER (Hızlı & Güvenli) ---
+def estimate_arima_models(prices):
     returns = np.log(prices/prices.shift(1)).dropna()
     if len(returns) < 50: return 0.0
     try:
-        model = pm.auto_arima(returns, seasonal=is_sarima, m=5 if is_sarima else 1, stepwise=True, trace=False, error_action='ignore', suppress_warnings=True, scoring='aic')
-        forecast_ret = model.predict(n_periods=1)[0]
-        return float((prices.iloc[-1] * np.exp(forecast_ret) / prices.iloc[-1]) - 1.0)
+        model = pm.auto_arima(returns, seasonal=False, stepwise=True, trace=False, error_action='ignore', suppress_warnings=True, scoring='aic')
+        return float(model.predict(n_periods=1)[0])
     except: return 0.0
 
-def estimate_nnar_models(returns):
+def estimate_garch_vol(returns):
     if len(returns) < 100: return 0.0
-    lags = 5
-    X = pd.DataFrame({f'lag_{i}': returns.shift(i) for i in range(1, lags + 1)}).dropna()
-    y = returns[lags:]
-    if X.empty: return 0.0
     try:
-        model = MLPRegressor(hidden_layer_sizes=(10,), max_iter=100, random_state=42).fit(X.iloc[:-1], y.iloc[:-1])
-        return float(model.predict(X.iloc[-1].values.reshape(1,-1))[0])
+        am = arch_model(100*returns, vol='GARCH', p=1, o=0, q=1, dist='StudentsT')
+        res = am.fit(disp='off')
+        return float(np.sqrt(res.forecast(horizon=1).variance.iloc[-1,0])/100)
     except: return 0.0
 
-def adaptive_ga_optimize(df, features):
-    test_size = 30
-    train = df.iloc[:-test_size]; val = df.iloc[-test_size:]
-    X_tr = train[features].replace([np.inf, -np.inf], np.nan).fillna(0); y_tr = train['target']
-    X_val = val[features].replace([np.inf, -np.inf], np.nan).fillna(0); y_val = val['target']
-    
-    if X_tr.empty: return {'rf':{'d':5,'n':100}, 'xgb':{'d':3,'n':100}}, 0
-    best_overall_score = -999
-    best_overall_params = {'rf':{'d':5,'n':100}, 'xgb':{'d':3,'n':100}}
-    best_gen = 5
-    
-    for gen in [1, 3, 5, 8, 10]:
-        b_rf = -999; p_rf = {'d':5, 'n':100}
-        for d in [3, 5, 7]:
-            m = RandomForestClassifier(n_estimators=gen*20, max_depth=d, random_state=42).fit(X_tr, y_tr)
-            if m.score(X_val, y_val) > b_rf: b_rf=m.score(X_val, y_val); p_rf={'d':d, 'n':gen*20}
-        
-        b_xgb = -999; p_xgb = {'d':3, 'lr':0.1, 'n':100}
-        for d in [3, 5]:
-            m = xgb.XGBClassifier(n_estimators=gen*20, max_depth=d, eval_metric='logloss').fit(X_tr, y_tr)
-            if m.score(X_val, y_val) > b_xgb: b_xgb=m.score(X_val, y_val); p_xgb={'d':d, 'lr':0.1, 'n':gen*20}
-            
-        lvl_score = (b_rf + b_xgb) / 2
-        if lvl_score > best_overall_score:
-            best_overall_score = lvl_score; best_overall_params = {'rf': p_rf, 'xgb': p_xgb}; best_gen = gen
-            
-    return best_overall_params, best_gen
+def ga_optimize(df, features):
+    return {'rf':{'d':5,'n':100}, 'xgb':{'d':3,'n':100}}
 
+# --- ANA MOTOR (Meta-Learner) ---
 def train_meta_learner(df, params):
     test_size = 60
-    if len(df) < test_size + 50: return 0.0, None, {}
-    train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
+    if len(df) < 150: return 0.0, None
     
-    # YENİ ÖZELLİKLER EKLENDİ
-    features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta', 'corr_btc', 'rel_strength', 'beta']
+    train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
+    features = ['log_ret', 'vol_regime', 'momentum'] 
     
     X_tr = train[features].replace([np.inf, -np.inf], np.nan).fillna(0); y_tr = train['target']
     X_test = test[features].replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    if X_tr.empty: return 0.0, None, {}
-
-    arima_ret = estimate_arima_models(train['close'], False)
-    sarima_ret = estimate_arima_models(train['close'], True)
-    nnar_ret = estimate_nnar_models(train['log_ret'].dropna())
-    garch_ret = select_best_garch_model(train['log_ret'].dropna())
-    scaler_vol = StandardScaler()
-    try: garch_signal = float(-np.sign(scaler_vol.fit_transform(np.array(train['range'].values).reshape(-1, 1)).flatten()[-1]))
-    except: garch_signal = 0.0
-
-    rf = RandomForestClassifier(n_estimators=params['rf']['n'], max_depth=params['rf']['d']).fit(X_tr, y_tr)
-    etc = ExtraTreesClassifier(n_estimators=params['rf']['n'], max_depth=params['rf']['d']).fit(X_tr, y_tr)
-    xgb_c = xgb.XGBClassifier(n_estimators=params['xgb']['n'], max_depth=params['xgb']['d']).fit(X_tr, y_tr)
-    xgb_solo = xgb.XGBClassifier(n_estimators=params['xgb']['n'], max_depth=params['xgb']['d'], learning_rate=0.1).fit(X_tr, y_tr)
     
+    if X_tr.empty: return 0.0, None
+
+    # Level 1
+    rf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42).fit(X_tr, y_tr)
+    et = ExtraTreesClassifier(n_estimators=100, max_depth=5, random_state=42).fit(X_tr, y_tr)
+    xgb_c = xgb.XGBClassifier(n_estimators=100, max_depth=3, eval_metric='logloss').fit(X_tr, y_tr)
+    
+    # Ekonometrik Sinyaller
+    arima_sig = estimate_arima_models(train['close'])
+    garch_sig = estimate_garch_vol(train['log_ret'].dropna())
+    
+    # HMM
     scaler_hmm = StandardScaler()
     try:
-        X_hmm = scaler_hmm.fit_transform(train[['log_ret', 'range_vol_delta']].replace([np.inf, -np.inf], np.nan).fillna(0))
-        hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50).fit(X_hmm)
+        X_hmm = scaler_hmm.fit_transform(train[['log_ret']])
+        hmm = GaussianHMM(n_components=2, covariance_type='diag', n_iter=50).fit(X_hmm)
         hmm_probs = hmm.predict_proba(X_hmm)
-    except: hmm_probs = np.zeros((len(train),3)); hmm = None
-    hmm_df = pd.DataFrame(hmm_probs, columns=['HMM_0','HMM_1','HMM_2'], index=train.index)
-
+    except: hmm_probs = np.zeros((len(train),2))
+    
+    # Meta-Data
     meta_X = pd.DataFrame({
-        'RF': rf.predict_proba(X_tr)[:,1], 'ETC': etc.predict_proba(X_tr)[:,1], 'XGB': xgb_c.predict_proba(X_tr)[:,1],
-        'Heuristic': train['heuristic'], 'HMM_0': hmm_df['HMM_0'], 'HMM_1': hmm_df['HMM_1'], 'HMM_2': hmm_df['HMM_2'],
-        'ARIMA': np.full(len(train), arima_ret), 'SARIMA': np.full(len(train), sarima_ret),
-        'NNAR': np.full(len(train), nnar_ret), 'GARCH': np.full(len(train), garch_ret), 'VolSig': np.full(len(train), garch_signal),
-        'BTC_Corr': train['corr_btc'], 'Rel_Str': train['rel_strength'] # Yeni Meta Özellikler
+        'RF': rf.predict_proba(X_tr)[:,1],
+        'ET': et.predict_proba(X_tr)[:,1],
+        'XGB': xgb_c.predict_proba(X_tr)[:,1],
+        'HMM_0': hmm_probs[:,0],
+        'ARIMA': np.full(len(train), arima_sig),
+        'GARCH': np.full(len(train), garch_sig)
     }, index=train.index).fillna(0)
     
-    scaler_meta = StandardScaler()
-    try: meta_X_sc = scaler_meta.fit_transform(meta_X)
-    except: meta_X_sc = meta_X.values
-    meta_model = LogisticRegression(C=1.0).fit(meta_X_sc, y_tr)
-    weights = meta_model.coef_[0]
+    # Level 2 XGBoost
+    meta_model = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.05).fit(meta_X, y_tr)
     
-    # Test
-    arima_t = estimate_arima_models(test['close'], False)
-    sarima_t = estimate_arima_models(test['close'], True)
-    nnar_t = estimate_nnar_models(test['log_ret'].dropna())
-    garch_t = select_best_garch_model(test['log_ret'].dropna())
-    try: garch_sig_t = float(-np.sign(scaler_vol.transform(np.array(test['range'].values).reshape(-1, 1)).flatten()[-1]))
-    except: garch_sig_t = 0.0
-    
+    # Test Sinyalleri
+    arima_t = estimate_arima_models(test['close'])
+    garch_t = estimate_garch_vol(test['log_ret'].dropna())
     try:
-        X_hmm_t = scaler_hmm.transform(test[['log_ret', 'range_vol_delta']].replace([np.inf, -np.inf], np.nan).fillna(0))
-        hmm_probs_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
-    except: hmm_probs_t = np.zeros((len(test),3))
-    hmm_df_t = pd.DataFrame(hmm_probs_t, columns=['HMM_0','HMM_1','HMM_2'], index=test.index)
+        X_hmm_t = scaler_hmm.transform(test[['log_ret']].fillna(0))
+        hmm_probs_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),2))
+    except: hmm_probs_t = np.zeros((len(test),2))
     
     mx_test = pd.DataFrame({
-        'RF': rf.predict_proba(X_test)[:,1], 'ETC': etc.predict_proba(X_test)[:,1], 'XGB': xgb_c.predict_proba(X_test)[:,1],
-        'Heuristic': test['heuristic'], 'HMM_0': hmm_df_t['HMM_0'], 'HMM_1': hmm_df_t['HMM_1'], 'HMM_2': hmm_df_t['HMM_2'],
-        'ARIMA': np.full(len(test), arima_t), 'SARIMA': np.full(len(test), sarima_t),
-        'NNAR': np.full(len(test), nnar_t), 'GARCH': np.full(len(test), garch_t), 'VolSig': np.full(len(test), garch_sig_t),
-        'BTC_Corr': test['corr_btc'], 'Rel_Str': test['rel_strength']
+        'RF': rf.predict_proba(X_test)[:,1],
+        'ET': et.predict_proba(X_test)[:,1],
+        'XGB': xgb_c.predict_proba(X_test)[:,1],
+        'HMM_0': hmm_probs_t[:,0],
+        'ARIMA': np.full(len(test), arima_t),
+        'GARCH': np.full(len(test), garch_t)
     }, index=test.index).fillna(0)
     
-    try: mx_test_sc = scaler_meta.transform(mx_test)
-    except: mx_test_sc = mx_test.values
+    probs_ens = meta_model.predict_proba(mx_test)[:,1]
+    probs_xgb = xgb_c.predict_proba(X_test)[:,1]
     
-    probs_ens = meta_model.predict_proba(mx_test_sc)[:,1]
-    probs_xgb = xgb_solo.predict_proba(X_test)[:,1]
+    # Simülasyon (Trend Filtreli)
+    sim_ens=[100]; sim_solo=[100]; p0=test['close'].iloc[0]
     
-    sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     for i in range(len(test)):
-        p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
-        se=(probs_ens[i]-0.5)*2; sx=(probs_xgb[i]-0.5)*2
-        if se>0.1: sim_ens.append(sim_ens[-1]*(1+ret))
-        else: sim_ens.append(sim_ens[-1])
-        if sx>0.1: sim_xgb.append(sim_xgb[-1]*(1+ret))
-        else: sim_xgb.append(sim_xgb[-1])
-        sim_hodl.append((100/p0)*p)
+        ret = test['ret'].iloc[i]
+        trend_up = test['trend_up'].iloc[i] == 1
+        sell_thresh = -0.3 if trend_up else -0.1
         
-    roi_ens = sim_ens[-1]-100; roi_xgb = sim_xgb[-1]-100
+        # Ensemble
+        pos_ens = np.tanh(3 * (probs_ens[i]-0.5)*2)
+        if pos_ens > 0.2: sim_ens.append(sim_ens[-1]*(1+ret*abs(pos_ens)))
+        elif pos_ens < sell_thresh: sim_ens.append(sim_ens[-1]) # Satış
+        else: sim_ens.append(sim_ens[-1]) # Bekle
+        
+        # Solo
+        pos_solo = np.tanh(3 * (probs_xgb[i]-0.5)*2)
+        if pos_solo > 0.2: sim_solo.append(sim_solo[-1]*(1+ret*abs(pos_solo)))
+        elif pos_solo < sell_thresh: sim_solo.append(sim_solo[-1])
+        else: sim_solo.append(sim_solo[-1])
+        
+    roi_ens = sim_ens[-1]-100; roi_solo = sim_solo[-1]-100
     
-    weights_dict = dict(zip(meta_X.columns, weights))
-    if roi_xgb > roi_ens:
-        return (probs_xgb[-1]-0.5)*2, {'bot_roi': roi_xgb, 'method': 'Solo XGBoost', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}
+    if roi_solo > roi_ens:
+        sig = (probs_xgb[-1]-0.5)*2
+        if test['trend_up'].iloc[-1]==1 and -0.3 < sig < -0.1: sig=0.0
+        return sig, {'bot_roi': roi_solo, 'method': 'Solo XGB'}
     else:
-        return (probs_ens[-1]-0.5)*2, {'bot_roi': roi_ens, 'method': 'Ensemble', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}
+        sig = (probs_ens[-1]-0.5)*2
+        if test['trend_up'].iloc[-1]==1 and -0.3 < sig < -0.1: sig=0.0
+        return sig, {'bot_roi': roi_ens, 'method': 'Ensemble'}
 
+# --- ÇALIŞTIRMA MANTIĞI ---
 def run_bot_logic():
     print(f"🚀 Bot Başlatılıyor... {datetime.now()}")
     pf_df, sheet = load_and_fix_portfolio()
@@ -349,70 +281,63 @@ def run_bot_logic():
     total_cash = updated['Nakit_Bakiye_USD'].sum()
     signals = []
     
-    # Piyasa Verisini Çek (Global)
-    market_df = get_market_data()
-    
     for i, (idx, row) in enumerate(updated.iterrows()):
         ticker = row['Ticker']
         if len(str(ticker))<3: continue
         print(f"🧠 {ticker}...")
+        
         raw_df = get_raw_data(ticker)
         if raw_df is None: continue
-        
         current_p = float(raw_df['close'].iloc[-1])
-        best_roi = -9999; final_sig = 0; winning_tf = "GÜNLÜK"; imp_method = "-"; best_gen = 0
+        best_roi = -9999; final_sig = 0; winning_tf = "GÜNLÜK"
         
         for tf_name, tf_code in {'GÜNLÜK':'D', 'HAFTALIK':'W'}.items():
-            # Piyasa verisini de process_data'ya gönder
-            df_raw = process_data(raw_df, tf_code, market_df)
+            df_raw = process_data(raw_df, tf_code)
             if df_raw is None: continue
-            
-            # YENİ ÖZELLİKLER EKLENDİ
-            feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta', 'corr_btc', 'rel_strength', 'beta']
-            df_imp, method_imp = smart_impute(df_raw, feats)
-            
-            best_params, best_g = adaptive_ga_optimize(df_imp, feats)
-            sig, info = train_meta_learner(df_imp, best_params)
+            df_imp, _ = smart_impute(df_raw, ['log_ret', 'vol_regime', 'momentum'])
+            sig, info = train_meta_learner(df_imp, ga_optimize(df_imp, []))
             
             if info and info['bot_roi'] > best_roi:
                 best_roi = info['bot_roi']
                 final_sig = sig
                 winning_tf = tf_name
-                imp_method = method_imp
-                best_gen = best_g
         
-        signals.append({'idx':idx, 'ticker':ticker, 'price':current_p, 'signal':final_sig, 'roi':best_roi, 'tf':winning_tf, 'method':imp_method, 'status':row['Durum'], 'amount':float(row['Miktar'])})
-        print(f"   > Gen: {best_gen} | ROI: {best_roi:.2f}")
+        signals.append({'idx':idx, 'ticker':ticker, 'price':current_p, 'signal':final_sig, 'roi':best_roi, 'tf':winning_tf, 'status':row['Durum'], 'amount':float(row['Miktar'])})
+        print(f"   > {ticker}: ROI {best_roi:.2f}% ({winning_tf})")
 
-    # Orantılı Dağıtım (Proportional Allocation)
+    # Satış
     for s in signals:
-        if s['status']=='COIN' and s['signal']<-0.1:
+        if s['status']=='COIN' and s['signal'] < 0.2:
             rev=s['amount']*s['price']; total_cash+=rev
             updated.at[s['idx'],'Durum']='CASH'; updated.at[s['idx'],'Miktar']=0.0
             updated.at[s['idx'],'Nakit_Bakiye_USD']=0.0
             updated.at[s['idx'],'Son_Islem_Log']=f"SAT ({s['tf']})"
             updated.at[s['idx'],'Son_Islem_Zamani']=time_str
+            print(f"🔻 SATILDI: {s['ticker']}")
             
-    buy_cands = [s for s in signals if s['signal']>0.1 and s['roi']>0]
-    total_pos_roi = sum([s['roi'] for s in buy_cands])
+    # Alım (Orantılı)
+    buy_cands = [s for s in signals if s['signal']>0.2 and s['roi']>0]
+    total_roi = sum([s['roi'] for s in buy_cands])
     
     if buy_cands and total_cash>1.0:
         for w in buy_cands:
-            weight = w['roi'] / total_pos_roi
+            weight = w['roi']/total_roi
             amt_usd = total_cash * weight
             if updated.at[w['idx'],'Durum']=='CASH':
                 amt = amt_usd/w['price']
                 updated.at[w['idx'],'Durum']='COIN'; updated.at[w['idx'],'Miktar']=amt
                 updated.at[w['idx'],'Nakit_Bakiye_USD']=0.0
                 updated.at[w['idx'],'Son_Islem_Fiyati']=w['price']
-                updated.at[w['idx'],'Son_Islem_Log']=f"AL ({weight*100:.0f}%)"
+                updated.at[w['idx'],'Son_Islem_Log']=f"AL (%{weight*100:.0f})"
                 updated.at[w['idx'],'Son_Islem_Zamani']=time_str
+                print(f"🚀 ALINDI: {w['ticker']} (Pay: %{weight*100:.0f})")
     elif total_cash>0:
-        f_idx = updated.index[0]
-        updated.at[f_idx,'Nakit_Bakiye_USD'] += total_cash
+        f = updated.index[0]
+        updated.at[f,'Nakit_Bakiye_USD'] += total_cash
         for ix in updated.index:
-            if ix!=f_idx and updated.at[ix,'Durum']=='CASH': updated.at[ix,'Nakit_Bakiye_USD']=0.0
+            if ix!=f and updated.at[ix,'Durum']=='CASH': updated.at[ix,'Nakit_Bakiye_USD']=0.0
 
+    # Değerleme
     for idx, row in updated.iterrows():
         p = next((s['price'] for s in signals if s['idx']==idx), 0.0)
         if p>0: updated.at[idx,'Kaydedilen_Deger_USD'] = (float(updated.at[idx,'Miktar'])*p) if updated.at[idx,'Durum']=='COIN' else float(updated.at[idx,'Nakit_Bakiye_USD'])
