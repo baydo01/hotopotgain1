@@ -11,42 +11,42 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import pytz
 
-# --- İstatiksel ve Ekonometrik Kütüphaneler ---
+# İstatistik ve ML
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.stats.diagnostic import acorr_ljungbox
 import pmdarima as pm
 from arch import arch_model
-from scipy.stats import boxcox, yeojohnson
-
-# --- AI & ML Kütüphaneleri ---
-# DÜZELTME: IterativeImputer için önce bu satır gelmeli:
-from sklearn.experimental import enable_iterative_imputer 
-# Sonra Imputer'lar çağrılmalı:
-from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer
-
 from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPRegressor
+from sklearn.impute import KNNImputer, SimpleImputer, IterativeImputer
 import xgboost as xgb
 import plotly.graph_objects as go
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Hedge Fund AI: Smart Imputation", layout="wide")
-st.title("🧠 Hedge Fund AI: Smart Imputation & Auto-Select")
+st.set_page_config(page_title="Hedge Fund AI: Mega Dashboard", layout="wide", page_icon="🏦")
+st.title("🏦 Hedge Fund AI: Mega Dashboard (Imputation & Benchmark)")
 
 # =============================================================================
-# 1. AYARLAR VE SABİTLER
+# 1. AYARLAR
 # =============================================================================
 SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
 CREDENTIALS_FILE = "service_account.json"
 TARGET_COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD"]
 DATA_PERIOD = "3y"
 
+with st.sidebar:
+    st.header("⚙️ Model Ayarları")
+    use_ga = st.checkbox("Genetic Algoritma (GA) Aktif", value=True)
+    ga_gens = st.number_input("GA Döngü Sayısı", 1, 50, 5)
+    st.divider()
+    st.info("Bu panel; Smart Imputation, Walk-Forward Validation ve Benchmark kıyaslamalarını tek ekranda sunar.")
+
 # =============================================================================
-# 2. GOOGLE SHEETS ENTEGRASYONU
+# 2. GOOGLE SHEETS
 # =============================================================================
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -93,14 +93,12 @@ def save_portfolio(df, sheet):
     except: pass
 
 # =============================================================================
-# 3. ANALİZ MOTORU
+# 3. VERİ İŞLEME
 # =============================================================================
-
 def apply_kalman_filter(prices):
-    n_iter = len(prices); sz = (n_iter,); Q = 1e-5; R = 0.01 ** 2
-    xhat = np.zeros(sz); P = np.zeros(sz); xhatminus = np.zeros(sz); Pminus = np.zeros(sz); K = np.zeros(sz)
+    xhat = np.zeros(len(prices)); P = np.zeros(len(prices)); xhatminus = np.zeros(len(prices)); Pminus = np.zeros(len(prices)); K = np.zeros(len(prices)); Q = 1e-5; R = 0.01**2
     xhat[0] = prices.iloc[0]; P[0] = 1.0
-    for k in range(1, n_iter):
+    for k in range(1, len(prices)):
         xhatminus[k] = xhat[k-1]; Pminus[k] = P[k-1] + Q
         K[k] = Pminus[k]/(Pminus[k]+R); xhat[k] = xhatminus[k]+K[k]*(prices.iloc[k]-xhatminus[k]); P[k] = (1-K[k])*Pminus[k]
     return pd.Series(xhat, index=prices.index)
@@ -126,6 +124,9 @@ def process_data(df, timeframe):
     else: df_res=df.copy()
     if len(df_res)<100: return None
     
+    # NaN sayısını hesapla (Ham veri üzerinde)
+    nan_before = df_res.isna().sum().sum()
+    
     df_res['kalman_close'] = apply_kalman_filter(df_res['close'].fillna(method='ffill'))
     df_res['log_ret'] = np.log(df_res['kalman_close']/df_res['kalman_close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
@@ -141,12 +142,23 @@ def process_data(df, timeframe):
     df_res['target'] = (df_res['close'].shift(-1)>df_res['close']).astype(int)
     
     df_res.replace([np.inf, -np.inf], np.nan, inplace=True)
+    
+    # Feature Engineering sonrası toplam NaN (Imputation öncesi)
+    # Target hariç NaN'ları sayalım çünkü Target'ı impute etmiyoruz
+    features_to_check = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
+    nan_in_features = df_res[features_to_check].isna().sum().sum()
+    
     df_res.dropna(subset=['target'], inplace=True)
+    
+    # NaN bilgisini DataFrame attributes'a ekleyelim (hacky way)
+    df_res.attrs['nan_count'] = int(nan_in_features)
+    
     return df_res
 
 # --- SMART IMPUTATION ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
+    
     imputers = {'KNN': KNNImputer(n_neighbors=5), 'MICE': IterativeImputer(max_iter=10, random_state=42), 'Mean': SimpleImputer(strategy='mean')}
     best_score = -999; best_df = df.fillna(0); best_m = "Zero"
     
@@ -221,7 +233,7 @@ def train_meta_learner(df, params):
     X_tr = train[features]; y_tr = train['target']
     X_test = test[features]
     
-    # Sinyaller (Ham Veri)
+    # Sinyaller
     arima_ret = estimate_arima_models(train['close'], False)
     sarima_ret = estimate_arima_models(train['close'], True)
     nnar_ret = estimate_nnar_models(train['log_ret'].dropna())
@@ -233,9 +245,11 @@ def train_meta_learner(df, params):
         garch_signal = float(-np.sign(scaled_range_tr[-1])) if len(scaled_range_tr) > 0 else 0.0
     except: garch_signal = 0.0
 
+    # ML Models
     rf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42).fit(X_tr, y_tr)
     etc = ExtraTreesClassifier(n_estimators=100, max_depth=5, random_state=42).fit(X_tr, y_tr)
     xgb_c = xgb.XGBClassifier(n_estimators=100, max_depth=3).fit(X_tr, y_tr)
+    xgb_solo = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1).fit(X_tr, y_tr) # SOLO BENCHMARK
     
     # HMM
     scaler_hmm = StandardScaler()
@@ -263,10 +277,9 @@ def train_meta_learner(df, params):
     scaler_meta = StandardScaler()
     meta_X_sc = scaler_meta.fit_transform(meta_X)
     meta_model = LogisticRegression(C=1.0).fit(meta_X_sc, y_tr)
-    weights = meta_model.coef_[0]
     
     # Test
-    # (Test için modelleri tekrar çalıştırmıyoruz, statik sinyalleri yayıyoruz - Hız için)
+    # Statik sinyalleri yay
     try:
         X_hmm_t = scaler_hmm.transform(test[['log_ret', 'range_vol_delta']].replace([np.inf, -np.inf], np.nan).fillna(0))
         hmm_probs_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
@@ -285,15 +298,52 @@ def train_meta_learner(df, params):
     }, index=test.index).fillna(0)
     
     probs = meta_model.predict_proba(scaler_meta.transform(mx_test))[:,1]
+    probs_xgb_solo = xgb_solo.predict_proba(X_test)[:,1]
     
+    # ROI Simülasyonları
     sim_eq = [100]
+    sim_xgb = [100]
+    sim_hodl = [100]
+    p0=test['close'].iloc[0]
+    
     for i in range(len(test)):
+        p = test['close'].iloc[i]
         ret = test['ret'].iloc[i]
+        
+        # Ensemble
         if probs[i]>0.55: sim_eq.append(sim_eq[-1]*(1+ret))
         else: sim_eq.append(sim_eq[-1])
         
-    weights_dict = dict(zip(meta_X.columns, weights))
-    return (probs[-1]-0.5)*2, {'bot_roi': sim_eq[-1]-100, 'weights': weights_dict, 'dates': test.index, 'sim_eq': sim_eq}
+        # Solo XGB
+        if probs_xgb_solo[i]>0.55: sim_xgb.append(sim_xgb[-1]*(1+ret))
+        else: sim_xgb.append(sim_xgb[-1])
+        
+        # HODL
+        sim_hodl.append((100/p0)*p)
+        
+    weights = dict(zip(meta_X.columns, meta_model.coef_[0]))
+    
+    # Kazananı Belirle
+    final_roi_ens = sim_eq[-1]-100
+    final_roi_xgb = sim_xgb[-1]-100
+    
+    if final_roi_xgb > final_roi_ens:
+        active_roi = final_roi_xgb
+        active_sim = sim_xgb
+        active_method = "Solo XGBoost"
+        active_sig = (probs_xgb_solo[-1]-0.5)*2
+    else:
+        active_roi = final_roi_ens
+        active_sim = sim_eq
+        active_method = "Ensemble"
+        active_sig = (probs[-1]-0.5)*2
+        
+    info = {
+        'bot_roi': active_roi, 'method': active_method,
+        'weights': weights, 'dates': test.index, 
+        'sim_ens': sim_eq, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl
+    }
+    return active_sig, info
 
 def analyze_ticker_tournament(ticker):
     raw_df = get_raw_data(ticker)
@@ -303,26 +353,31 @@ def analyze_ticker_tournament(ticker):
     best_roi = -9999; final_res = None
     
     for tf_name, tf_code in {'GÜNLÜK':'D', 'HAFTALIK':'W'}.items():
-        df = process_data(raw_df, tf_code)
-        if df is None: continue
+        df_raw = process_data(raw_df, tf_code)
+        if df_raw is None: continue
+        
+        # NaN Count
+        nan_count = df_raw.attrs.get('nan_count', 0)
         
         # Smart Impute
         feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
-        df_imp, method = smart_impute(df, feats)
+        df_imp, method = smart_impute(df_raw, feats)
         
         sig, info = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
+        
         if info and info['bot_roi'] > best_roi:
             best_roi = info['bot_roi']
             final_res = {
                 'ticker': ticker, 'price': current_price, 'roi': best_roi,
-                'signal': sig, 'tf': tf_name, 'info': info, 'method': method
+                'signal': sig, 'tf': tf_name, 'info': info, 'method': method,
+                'nan_count': nan_count, 'imp_method': method
             }
     return final_res
 
 # =============================================================================
 # ARAYÜZ
 # =============================================================================
-st.markdown("### 📈 Portföy Durumu & Smart Imputation")
+st.markdown("### 📈 Portföy Durumu & Smart Imputation Dashboard")
 pf_df, sheet = load_and_fix_portfolio()
 
 if not pf_df.empty:
@@ -337,7 +392,7 @@ if not pf_df.empty:
     
     st.dataframe(pf_df[['Ticker','Durum','Miktar','Kaydedilen_Deger_USD','Son_Islem_Log']], use_container_width=True)
     
-    if st.button("🚀 ANALİZ ET (Imputation Testli)", type="primary"):
+    if st.button("🚀 ANALİZ ET (Full Detail)", type="primary"):
         updated = pf_df.copy()
         total_pool = updated['Nakit_Bakiye_USD'].sum()
         results = []
@@ -352,21 +407,47 @@ if not pf_df.empty:
                 res['idx']=idx; res['status']=row['Durum']; res['amount']=float(row['Miktar'])
                 results.append(res)
                 
-                with st.expander(f"📊 {ticker} | Imputation: {res['method']} | ROI: %{res['roi']:.2f}"):
+                # --- DETAYLI GÖRÜNÜM (TABLI YAPI) ---
+                with st.expander(f"📊 {ticker} | ROI: %{res['roi']:.2f} | Model: {res['info']['method']}"):
+                    
+                    tab1, tab2, tab3 = st.tabs(["📈 Performans & Kıyaslama", "🧠 Model Ağırlıkları", "🧬 Veri Sağlığı"])
+                    
                     info = res['info']
-                    # Model Ağırlıkları
-                    w_df = pd.DataFrame.from_dict(info['weights'], orient='index', columns=['Etki'])
-                    w_df['Etki'] = w_df['Etki'].abs()
-                    w_df = w_df.sort_values(by='Etki', ascending=False)
                     
-                    wc1, wc2 = st.columns([1, 2])
-                    wc1.dataframe(w_df)
-                    
-                    # Grafik
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=info['dates'], y=info['sim_eq'], name='Bot', line=dict(color='#00CC96', width=2)))
-                    wc2.plotly_chart(fig, use_container_width=True)
-                    
+                    with tab1:
+                        st.markdown("##### Strateji Kıyaslaması")
+                        fig = go.Figure()
+                        # Grafikler: Ensemble, XGBoost ve HODL
+                        # (sim array uzunluklarını tarihle eşle)
+                        dates = info['dates']
+                        l = len(dates)
+                        fig.add_trace(go.Scatter(x=dates, y=info['sim_ens'][-l:], name='Ensemble (Bot)', line=dict(color='#00CC96', width=3)))
+                        fig.add_trace(go.Scatter(x=dates, y=info['sim_xgb'][-l:], name='Solo XGBoost', line=dict(color='#636EFA', width=2, dash='dot')))
+                        fig.add_trace(go.Scatter(x=dates, y=info['sim_hodl'][-l:], name='HODL (Piyasa)', line=dict(color='gray', width=1)))
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Metrikler
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Ensemble ROI", f"%{info['sim_ens'][-1]-100:.2f}")
+                        m2.metric("XGBoost ROI", f"%{info['sim_xgb'][-1]-100:.2f}")
+                        m3.metric("Piyasa ROI", f"%{info['sim_hodl'][-1]-100:.2f}")
+
+                    with tab2:
+                        st.markdown("##### Meta-Learner Karar Ağırlıkları")
+                        w_df = pd.DataFrame.from_dict(info['weights'], orient='index', columns=['Etki'])
+                        w_df['Mutlak Etki'] = w_df['Etki'].abs()
+                        w_df = w_df.sort_values(by='Mutlak Etki', ascending=False)
+                        st.bar_chart(w_df['Etki'])
+                        st.dataframe(w_df)
+
+                    with tab3:
+                        st.markdown("##### Veri Kalitesi ve İşleme")
+                        k1, k2, k3 = st.columns(3)
+                        k1.metric("Doldurulan NaN Sayısı", f"{res['nan_count']} adet")
+                        k2.metric("Kullanılan Imputer", f"{res['imp_method']}")
+                        k3.metric("Zaman Dilimi", f"{res['tf']}")
+                        st.info("NaN değerleri; KNN, MICE ve Mean yöntemleri yarıştırılarak en iyi performansı veren metod ile doldurulmuştur.")
+
             prog.progress((i+1)/len(updated))
             
         # Ortak Kasa Mantığı
