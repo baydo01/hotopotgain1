@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() # BURASI ARTIK KORUNACAK
+    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN ARTIK KORUNUYOR
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -149,7 +149,7 @@ def process_data(df, timeframe):
     df_res.attrs['nan_count'] = int(nan_in_features)
     return df_res
 
-# --- SMART IMPUTATION (HATA DÜZELTİLDİ) ---
+# --- SMART IMPUTATION (FIXED: KeyError 'ret' Çözüldü) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
     
@@ -171,8 +171,9 @@ def smart_impute(df, features):
             
             if s > best_score:
                 best_score = s; best_m = name
-                # Ana DF'in kopyasını al ve SADECE ilgili sütunları güncelle
-                # Bu sayede 'ret', 'close' gibi diğer sütunlar korunur.
+                
+                # HATA DÜZELTME: Yeni bir DF oluşturmak yerine kopyasını alıp içine yazıyoruz
+                # Böylece 'ret', 'close' gibi sütunlar kaybolmuyor.
                 temp_df = df.copy()
                 temp_df[features] = imp.fit_transform(df[features])
                 best_df = temp_df
@@ -306,44 +307,26 @@ def train_meta_learner(df, params):
     
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
-    # KEY ERROR DÜZELTME: 'ret' sütununu garantiye al
+    # HATA DÜZELTME: 'ret' sütunu artık df_imp'de (yani 'test' dataframe'inde) mevcut
     if 'ret' not in test.columns:
         test['ret'] = test['close'].pct_change().fillna(0)
-        
+
     for i in range(len(test)):
         p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
-        
-        # Trend Filtresi
-        trend_up = test['trend_up'].iloc[i] == 1
-        sell_thresh = -0.3 if trend_up else -0.1
-
         se=(probs_ens[i]-0.5)*2; sx=(probs_xgb[i]-0.5)*2
         if se>0.1: sim_ens.append(sim_ens[-1]*(1+ret))
-        elif se<sell_thresh: sim_ens.append(sim_ens[-1]) # Sat
-        else: sim_ens.append(sim_ens[-1]) # Bekle (Trend koruması)
-        
+        else: sim_ens.append(sim_ens[-1])
         if sx>0.1: sim_xgb.append(sim_xgb[-1]*(1+ret))
-        elif sx<sell_thresh: sim_xgb.append(sim_xgb[-1])
         else: sim_xgb.append(sim_xgb[-1])
-        
         sim_hodl.append((100/p0)*p)
         
     roi_ens = sim_ens[-1]-100; roi_xgb = sim_xgb[-1]-100
     weights_dict = dict(zip(meta_X.columns, weights))
     
     if roi_xgb > roi_ens:
-        # Son sinyale trend filtresi uygula
-        last_trend = test['trend_up'].iloc[-1] == 1
-        sig = (probs_xgb[-1]-0.5)*2
-        if last_trend and -0.3 < sig < -0.1: sig = 0.0
-        
-        return sig, {'bot_roi': roi_xgb, 'method': 'Solo XGBoost', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
+        return (probs_xgb[-1]-0.5)*2, {'bot_roi': roi_xgb, 'method': 'Solo XGBoost', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
     else:
-        last_trend = test['trend_up'].iloc[-1] == 1
-        sig = (probs_ens[-1]-0.5)*2
-        if last_trend and -0.3 < sig < -0.1: sig = 0.0
-        
-        return sig, {'bot_roi': roi_ens, 'method': 'Ensemble', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
+        return (probs_ens[-1]-0.5)*2, {'bot_roi': roi_ens, 'method': 'Ensemble', 'weights': weights_dict, 'sim_ens': sim_ens, 'sim_xgb': sim_xgb, 'sim_hodl': sim_hodl, 'dates': test.index}, weights
 
 def analyze_ticker_tournament(ticker):
     raw_df = get_raw_data(ticker)
@@ -357,7 +340,7 @@ def analyze_ticker_tournament(ticker):
         nan_count = df_raw.attrs.get('nan_count', 0)
         feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
         
-        # DÜZELTİLEN YER: 'ret' kaybolmaz
+        # Düzeltilmiş Smart Impute
         df_imp, method = smart_impute(df_raw, feats)
         
         sig, info, _ = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
@@ -381,6 +364,7 @@ if not pf_df.empty:
     total_coin = pf_df[pf_df['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
     parked = pf_df['Nakit_Bakiye_USD'].sum()
     total = total_coin + parked
+    
     c1,c2,c3 = st.columns(3)
     c1.metric("Toplam Varlık", f"${total:.2f}")
     c2.metric("Coinlerdeki Para", f"${total_coin:.2f}")
