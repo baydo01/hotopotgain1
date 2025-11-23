@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Hedge Fund AI: Mega Dashboard", layout="wide", page_icon="🏦")
-st.title("🏦 Hedge Fund AI: Mega Dashboard (Final)")
+st.title("🏦 Hedge Fund AI: Mega Dashboard (Final Stable)")
 
 # =============================================================================
 # 1. AYARLAR
@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN KORUNACAK
+    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN KORUNMALI
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -149,7 +149,7 @@ def process_data(df, timeframe):
     df_res.attrs['nan_count'] = int(nan_in_features)
     return df_res
 
-# --- SMART IMPUTATION (HATA ÇÖZÜMÜ BURADA) ---
+# --- SMART IMPUTATION (HATA DÜZELTİLDİ: Copy Metodu) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
     
@@ -173,7 +173,6 @@ def smart_impute(df, features):
                 best_score = s; best_m = name
                 
                 # KESİN ÇÖZÜM: Orijinal DF'yi kopyala ve sadece ilgili sütunları güncelle
-                # Böylece 'ret', 'close' gibi simülasyon için gerekenler SİLİNMEZ.
                 temp_df = df.copy()
                 temp_df[features] = imp.fit_transform(df[features])
                 best_df = temp_df
@@ -229,9 +228,10 @@ def train_meta_learner(df, params):
     if len(df)<150: return 0.0, None, {}
     train=df.iloc[:-test_size]; test=df.iloc[-test_size:]
     
-    # GÜVENLİK: 'ret' sütunu yoksa yeniden oluştur
+    # HATA DÜZELTME: Simülasyon öncesi 'ret' sütunu kontrolü (CAN SİMİDİ)
+    # Eğer imputation sırasında 'ret' silindiyse, burada tekrar hesaplanır.
     if 'ret' not in test.columns:
-        test = test.copy()
+        test = test.copy() # SettingWithCopy önleme
         test['ret'] = test['close'].pct_change().fillna(0)
 
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
@@ -313,7 +313,9 @@ def train_meta_learner(df, params):
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
     for i in range(len(test)):
-        p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
+        p=test['close'].iloc[i]; 
+        # Güvenli erişim
+        ret=test['ret'].iloc[i] if 'ret' in test.columns else 0.0 
         
         # Trend Filtresi
         trend_up = test['trend_up'].iloc[i] == 1
