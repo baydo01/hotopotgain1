@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Hedge Fund AI: Mega Dashboard", layout="wide", page_icon="🏦")
-st.title("🏦 Hedge Fund AI: Mega Dashboard (Final Stable)")
+st.title("🏦 Hedge Fund AI: Mega Dashboard (Clean Build)")
 
 # =============================================================================
 # 1. AYARLAR
@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN KORUNMALI
+    df_res['ret'] = df_res['close'].pct_change()
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -149,19 +149,18 @@ def process_data(df, timeframe):
     df_res.attrs['nan_count'] = int(nan_in_features)
     return df_res
 
-# --- SMART IMPUTATION (HATA DÜZELTİLDİ: Copy Metodu) ---
+# --- SMART IMPUTATION (SIFIRDAN YARATMA) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
     
     imputers = {'KNN': KNNImputer(n_neighbors=5), 'Mean': SimpleImputer(strategy='mean')}
-    best_score = -999; best_df = df.copy().fillna(0); best_m = "Zero"
+    best_score = -999; best_df = None; best_m = "Zero" # Başlangıçta None
     
     val_size = 20
     tr = df.iloc[:-val_size]; val = df.iloc[-val_size:]
     
     for name, imp in imputers.items():
         try:
-            # Sadece özellikleri impute et (Validation için)
             X_tr_imp = imp.fit_transform(tr[features])
             X_val_imp = imp.transform(val[features])
             
@@ -172,12 +171,24 @@ def smart_impute(df, features):
             if s > best_score:
                 best_score = s; best_m = name
                 
-                # KESİN ÇÖZÜM: Orijinal DF'yi kopyala ve sadece ilgili sütunları güncelle
-                temp_df = df.copy()
-                temp_df[features] = imp.fit_transform(df[features])
-                best_df = temp_df
+                # 1. Imputer ile SADECE özelliklerin olduğu yepyeni bir matris yarat
+                clean_matrix = imp.fit_transform(df[features])
+                
+                # 2. Bu matrisi DataFrame'e çevir (SIFIRDAN YARATILIYOR)
+                best_df = pd.DataFrame(clean_matrix, columns=features, index=df.index)
+                
+                # 3. Simülasyon için gerekli hayati organları (sütunları) eski tablodan buraya naklet
+                required_cols = ['ret', 'close', 'target', 'trend_up']
+                for col in required_cols:
+                    if col in df.columns:
+                        best_df[col] = df[col]
+                        
         except: continue
-            
+    
+    # Eğer hiçbir yöntem çalışmazsa fallback
+    if best_df is None:
+        best_df = df.fillna(0)
+
     return best_df, best_m
 
 # --- MODELLER ---
@@ -228,10 +239,9 @@ def train_meta_learner(df, params):
     if len(df)<150: return 0.0, None, {}
     train=df.iloc[:-test_size]; test=df.iloc[-test_size:]
     
-    # HATA DÜZELTME: Simülasyon öncesi 'ret' sütunu kontrolü (CAN SİMİDİ)
-    # Eğer imputation sırasında 'ret' silindiyse, burada tekrar hesaplanır.
-    if 'ret' not in test.columns:
-        test = test.copy() # SettingWithCopy önleme
+    # GÜVENLİK KONTROLÜ: Eğer imputation sonrası 'ret' hala yoksa
+    if 'ret' not in train.columns:
+        train['ret'] = train['close'].pct_change().fillna(0)
         test['ret'] = test['close'].pct_change().fillna(0)
 
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
@@ -313,9 +323,7 @@ def train_meta_learner(df, params):
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
     for i in range(len(test)):
-        p=test['close'].iloc[i]; 
-        # Güvenli erişim
-        ret=test['ret'].iloc[i] if 'ret' in test.columns else 0.0 
+        p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
         
         # Trend Filtresi
         trend_up = test['trend_up'].iloc[i] == 1
@@ -358,7 +366,7 @@ def analyze_ticker_tournament(ticker):
         nan_count = df_raw.attrs.get('nan_count', 0)
         feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
         
-        # DÜZELTİLEN YER: Kopya kullanarak imputation
+        # SIFIRDAN YARATMA YÖNTEMİ
         df_imp, method = smart_impute(df_raw, feats)
         
         sig, info, _ = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
