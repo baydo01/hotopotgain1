@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change() 
+    df_res['ret'] = df_res['close'].pct_change() # BU SÜTUN KORUNMALI
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -149,6 +149,7 @@ def process_data(df, timeframe):
     df_res.attrs['nan_count'] = int(nan_in_features)
     return df_res
 
+# --- SMART IMPUTATION (HATA ÇÖZÜMÜ BURADA) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
     
@@ -160,13 +161,19 @@ def smart_impute(df, features):
     
     for name, imp in imputers.items():
         try:
+            # Sadece özellikleri impute et (Validation için)
             X_tr_imp = imp.fit_transform(tr[features])
             X_val_imp = imp.transform(val[features])
+            
+            # Hızlı test
             rf = RandomForestClassifier(n_estimators=10, max_depth=3, random_state=42).fit(X_tr_imp, tr['target'])
             s = rf.score(X_val_imp, val['target'])
             
             if s > best_score:
                 best_score = s; best_m = name
+                
+                # KESİN ÇÖZÜM: Orijinal DF'yi kopyala ve sadece ilgili sütunları güncelle
+                # Böylece 'ret', 'close' gibi simülasyon için gerekenler SİLİNMEZ.
                 temp_df = df.copy()
                 temp_df[features] = imp.fit_transform(df[features])
                 best_df = temp_df
@@ -220,17 +227,12 @@ def ga_optimize(df, features):
 def train_meta_learner(df, params):
     test_size=60
     if len(df)<150: return 0.0, None, {}
+    train=df.iloc[:-test_size]; test=df.iloc[-test_size:]
     
-    # KOPYA ALARAK AYIR (SettingWithCopyWarning Önlemek için)
-    train = df.iloc[:-test_size].copy()
-    test = df.iloc[-test_size:].copy()
-    
-    # --- HATA DÜZELTME: 'ret' SÜTUNU GARANTİSİ ---
-    # Eğer imputation sırasında ret kaybolduysa veya bozulduysa yeniden hesapla ve temizle
-    if 'ret' not in train.columns or train['ret'].isna().any():
-        train['ret'] = train['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0)
-    if 'ret' not in test.columns or test['ret'].isna().any():
-        test['ret'] = test['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0)
+    # GÜVENLİK: 'ret' sütunu yoksa yeniden oluştur
+    if 'ret' not in test.columns:
+        test = test.copy()
+        test['ret'] = test['close'].pct_change().fillna(0)
 
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     X_tr = train[features].replace([np.inf, -np.inf], np.nan).fillna(0); y_tr = train['target']
@@ -310,10 +312,8 @@ def train_meta_learner(df, params):
     
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
-    # ARTIK 'ret' GARANTİ OLDUĞU İÇİN BURASI HATA VERMEZ
     for i in range(len(test)):
-        p=test['close'].iloc[i]; 
-        ret=test['ret'].iloc[i] 
+        p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
         
         # Trend Filtresi
         trend_up = test['trend_up'].iloc[i] == 1
@@ -356,6 +356,7 @@ def analyze_ticker_tournament(ticker):
         nan_count = df_raw.attrs.get('nan_count', 0)
         feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
         
+        # DÜZELTİLEN YER: Kopya kullanarak imputation
         df_imp, method = smart_impute(df_raw, feats)
         
         sig, info, _ = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
