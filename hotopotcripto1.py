@@ -17,7 +17,7 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 import pmdarima as pm
 from arch import arch_model
 
-# Imputation (MICE için experimental gerekli)
+# Imputation
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import KNNImputer, SimpleImputer, IterativeImputer
 
@@ -139,6 +139,10 @@ def process_data(df, timeframe):
     df_res['kalman'] = apply_kalman_filter(df_res['close'].fillna(method='ffill'))
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     
+    # --- DÜZELTME: Simülasyon için basit getiri eklendi ---
+    df_res['ret'] = df_res['close'].pct_change()
+    # ----------------------------------------------------
+    
     # Volatilite Rejimi (ATR Bazlı - GARCH yerine hızlı alternatif)
     hl = df_res['high'] - df_res['low']
     tr = np.max(pd.concat([hl, np.abs(df_res['high'] - df_res['close'].shift())], axis=1), axis=1)
@@ -172,7 +176,6 @@ def smart_impute(df, features):
     imputers = {
         'KNN': KNNImputer(n_neighbors=5), 
         'Mean': SimpleImputer(strategy='mean')
-        # MICE yavaşlattığı için opsiyonel bıraktım, gerekirse eklenebilir
     }
     
     best_score = -999; best_df = df.fillna(0); best_m = "Zero"
@@ -199,7 +202,7 @@ def smart_impute(df, features):
                 best_df = pd.DataFrame(full_imp, columns=features, index=df.index)
                 # Orijinal target'ı geri ekle
                 best_df['target'] = df['target']
-                # Diğer sütunları koru
+                # Diğer sütunları koru ('ret' dahil)
                 for c in df.columns: 
                     if c not in features and c != 'target': best_df[c] = df[c]
         except: continue
@@ -272,7 +275,6 @@ def train_meta_learner(df, params):
     }, index=train.index).fillna(0)
     
     # --- LEVEL 2 META-LEARNER (XGBoost Kullanıldı - Logistic Regression yerine) ---
-    # XGBoost multicollinearity ile daha iyi başa çıkar
     meta_model = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.05).fit(meta_X, y_tr)
     weights = meta_model.feature_importances_ # XGBoost feature importance verir
     
@@ -304,7 +306,8 @@ def train_meta_learner(df, params):
     sim_ens=[100]; sim_solo=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
     for i in range(len(test)):
-        ret = test['ret'].iloc[i]
+        # ARTIK 'ret' SÜTUNU VAR
+        ret = test['ret'].iloc[i] 
         p = test['close'].iloc[i]
         
         # Ensemble Sim
@@ -323,7 +326,6 @@ def train_meta_learner(df, params):
     roi_solo = sim_solo[-1]-100
     
     # KAZANAN SEÇİMİ
-    # Return değerleri DÜZELTİLDİ (2 Değer Döndürür)
     weights_dict = dict(zip(meta_X.columns, weights))
     
     if roi_solo > roi_ens:
@@ -346,10 +348,9 @@ def analyze_ticker_tournament(ticker):
         if df_raw is None: continue
         
         nan_count = df_raw.attrs.get('nan_count', 0)
-        feats = ['log_ret', 'vol_regime', 'momentum', 'historical_avg_score']
+        feats = ['log_ret', 'vol_regime', 'momentum']
         df_imp, method = smart_impute(df_raw, feats)
         
-        # HATA DÜZELTİLDİ: 2 değişkenle karşılıyoruz
         sig, info = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
         
         if info and info['bot_roi'] > best_roi:
