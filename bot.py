@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Hedge Fund AI: Mega Dashboard", layout="wide", page_icon="🏦")
-st.title("🏦 Hedge Fund AI: Mega Dashboard (Clean Build)")
+st.title("🏦 Hedge Fund AI: Mega Dashboard (Final Stable)")
 
 # =============================================================================
 # 1. AYARLAR
@@ -126,7 +126,7 @@ def process_data(df, timeframe):
     df_res['log_ret'] = np.log(df_res['close']/df_res['close'].shift(1))
     df_res['range'] = (df_res['high']-df_res['low'])/df_res['close']
     df_res['heuristic'] = calculate_heuristic_score(df_res)
-    df_res['ret'] = df_res['close'].pct_change()
+    df_res['ret'] = df_res['close'].pct_change() 
     df_res['avg_ret_5m'] = df_res['ret'].rolling(100).mean()*100
     df_res['avg_ret_3y'] = df_res['ret'].rolling(750).mean()*100
     
@@ -149,12 +149,11 @@ def process_data(df, timeframe):
     df_res.attrs['nan_count'] = int(nan_in_features)
     return df_res
 
-# --- SMART IMPUTATION (SIFIRDAN YARATMA) ---
 def smart_impute(df, features):
     if len(df) < 50: return df.fillna(0), "Simple-Zero"
     
     imputers = {'KNN': KNNImputer(n_neighbors=5), 'Mean': SimpleImputer(strategy='mean')}
-    best_score = -999; best_df = None; best_m = "Zero" # Başlangıçta None
+    best_score = -999; best_df = df.copy().fillna(0); best_m = "Zero"
     
     val_size = 20
     tr = df.iloc[:-val_size]; val = df.iloc[-val_size:]
@@ -163,32 +162,16 @@ def smart_impute(df, features):
         try:
             X_tr_imp = imp.fit_transform(tr[features])
             X_val_imp = imp.transform(val[features])
-            
-            # Hızlı test
             rf = RandomForestClassifier(n_estimators=10, max_depth=3, random_state=42).fit(X_tr_imp, tr['target'])
             s = rf.score(X_val_imp, val['target'])
             
             if s > best_score:
                 best_score = s; best_m = name
-                
-                # 1. Imputer ile SADECE özelliklerin olduğu yepyeni bir matris yarat
-                clean_matrix = imp.fit_transform(df[features])
-                
-                # 2. Bu matrisi DataFrame'e çevir (SIFIRDAN YARATILIYOR)
-                best_df = pd.DataFrame(clean_matrix, columns=features, index=df.index)
-                
-                # 3. Simülasyon için gerekli hayati organları (sütunları) eski tablodan buraya naklet
-                required_cols = ['ret', 'close', 'target', 'trend_up']
-                for col in required_cols:
-                    if col in df.columns:
-                        best_df[col] = df[col]
-                        
+                temp_df = df.copy()
+                temp_df[features] = imp.fit_transform(df[features])
+                best_df = temp_df
         except: continue
-    
-    # Eğer hiçbir yöntem çalışmazsa fallback
-    if best_df is None:
-        best_df = df.fillna(0)
-
+            
     return best_df, best_m
 
 # --- MODELLER ---
@@ -237,12 +220,17 @@ def ga_optimize(df, features):
 def train_meta_learner(df, params):
     test_size=60
     if len(df)<150: return 0.0, None, {}
-    train=df.iloc[:-test_size]; test=df.iloc[-test_size:]
     
-    # GÜVENLİK KONTROLÜ: Eğer imputation sonrası 'ret' hala yoksa
-    if 'ret' not in train.columns:
-        train['ret'] = train['close'].pct_change().fillna(0)
-        test['ret'] = test['close'].pct_change().fillna(0)
+    # KOPYA ALARAK AYIR (SettingWithCopyWarning Önlemek için)
+    train = df.iloc[:-test_size].copy()
+    test = df.iloc[-test_size:].copy()
+    
+    # --- HATA DÜZELTME: 'ret' SÜTUNU GARANTİSİ ---
+    # Eğer imputation sırasında ret kaybolduysa veya bozulduysa yeniden hesapla ve temizle
+    if 'ret' not in train.columns or train['ret'].isna().any():
+        train['ret'] = train['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0)
+    if 'ret' not in test.columns or test['ret'].isna().any():
+        test['ret'] = test['close'].pct_change().replace([np.inf, -np.inf], 0).fillna(0)
 
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     X_tr = train[features].replace([np.inf, -np.inf], np.nan).fillna(0); y_tr = train['target']
@@ -322,8 +310,10 @@ def train_meta_learner(df, params):
     
     sim_ens=[100]; sim_xgb=[100]; sim_hodl=[100]; p0=test['close'].iloc[0]
     
+    # ARTIK 'ret' GARANTİ OLDUĞU İÇİN BURASI HATA VERMEZ
     for i in range(len(test)):
-        p=test['close'].iloc[i]; ret=test['ret'].iloc[i]
+        p=test['close'].iloc[i]; 
+        ret=test['ret'].iloc[i] 
         
         # Trend Filtresi
         trend_up = test['trend_up'].iloc[i] == 1
@@ -366,7 +356,6 @@ def analyze_ticker_tournament(ticker):
         nan_count = df_raw.attrs.get('nan_count', 0)
         feats = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
         
-        # SIFIRDAN YARATMA YÖNTEMİ
         df_imp, method = smart_impute(df_raw, feats)
         
         sig, info, _ = train_meta_learner(df_imp, ga_optimize(df_imp, feats))
