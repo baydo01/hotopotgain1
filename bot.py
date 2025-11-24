@@ -3,15 +3,12 @@ import pandas as pd
 import numpy as np
 import warnings
 import gspread
-import os
-import json
 import logging
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import pytz
 
 # ML Libraries
-from arch import arch_model
 from hmmlearn.hmm import GaussianHMM
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
@@ -45,29 +42,48 @@ def load_portfolio():
     sheet = connect_sheet()
     if sheet is None: return pd.DataFrame(), None
     try:
-        df = pd.DataFrame(sheet.get_all_records())
-        cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
-        for c in cols:
+        # Tüm verileri çek
+        data = sheet.get_all_records()
+        if not data: return pd.DataFrame(), sheet
+        
+        df = pd.DataFrame(data)
+        
+        # Sayısal sütunları temizle
+        num_cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
+        for c in num_cols:
             if c in df.columns:
-                # Virgül/Nokta dönüşümü ve sayısal tip zorlama
                 df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+        
+        # Eğer 'Son_Islem_Zamani' sütunu yoksa oluştur
+        if 'Son_Islem_Zamani' not in df.columns:
+            df['Son_Islem_Zamani'] = "-"
+            
         return df, sheet
-    except: return pd.DataFrame(), None
+    except Exception as e:
+        logger.error(f"Load Error: {e}")
+        return pd.DataFrame(), None
 
 def save_portfolio(df, sheet):
     if sheet is None: return
     try:
-        df_exp = df.copy().astype(str)
+        # 1. NaN değerleri temizle (Google Sheets sevmez)
+        df_exp = df.copy().fillna("")
+        
+        # 2. Her şeyi string'e çevir (Format hatasını önler)
+        df_exp = df_exp.astype(str)
+        
+        # 3. Sheet'i TEMİZLE ve YENİDEN YAZ (En garanti yöntem)
+        sheet.clear() 
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
-        logger.info("Sheet Saved.")
+        logger.info("✅ Google Sheet TAMAMEN GÜNCELLENDİ.")
     except Exception as e:
-        logger.error(f"Save Error: {e}")
+        logger.error(f"❌ Save Error: {e}")
 
 # --- LOGIC ---
 def process_data(df):
     if len(df) < 150: return None
     df = df.copy()
-    # Kalman simplified
+    # Feature Engineering
     df['kalman'] = df['close'].rolling(3).mean() 
     df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
     df['ret'] = df['close'].pct_change()
@@ -104,13 +120,12 @@ class Brain:
         X_tr = train[features]; y_tr = train['target']
         X_test = test[features]
         
-        # Train Models
+        # Modeller
         rf = RandomForestClassifier(n_estimators=100, max_depth=5).fit(X_tr, y_tr)
         etc = ExtraTreesClassifier(n_estimators=100, max_depth=5).fit(X_tr, y_tr)
         xgb_c = xgb.XGBClassifier(n_estimators=100, max_depth=3).fit(X_tr, y_tr)
         xgb_solo = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1).fit(X_tr, y_tr)
         
-        # Meta HMM Feature
         try:
             scaler = StandardScaler()
             X_hmm = scaler.fit_transform(train[['log_ret', 'range_vol_delta']].fillna(0))
@@ -130,7 +145,6 @@ class Brain:
         
         self.meta.fit(meta_X, y_tr)
         
-        # Tournament Test
         try:
             X_hmm_t = scaler.transform(test[['log_ret', 'range_vol_delta']].fillna(0))
             hmm_probs_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
@@ -147,7 +161,6 @@ class Brain:
         p_ens = self.meta.predict_proba(meta_X_test)[:,1]
         p_solo = xgb_solo.predict_proba(X_test)[:,1]
         
-        # ROI Sim
         sim_ens = 100.0; sim_solo = 100.0
         rets = test['close'].pct_change().fillna(0).values
         for i in range(len(test)):
@@ -162,113 +175,81 @@ if __name__ == "__main__":
     logger.info("Bot Started.")
     pf, sheet = load_portfolio()
     if pf.empty: 
-        logger.error("Portfolio Empty or Load Failed.")
+        logger.error("Portfolio Empty.")
         exit()
     
     updated = pf.copy()
-    
-    # 1. Toplam Nakit Hesapla (Deadlock Önleyici)
-    # Eğer tüm satırlar 0 ise ve işlem yapmak istiyorsanız manuel olarak 
-    # Excel'e bakiye girmeniz gerekir. Kod burada mevcut bakiyeyi okur.
     cash = updated['Nakit_Bakiye_USD'].sum()
-    
     buys = []
     brain = Brain()
     
-    # Tarih formatı (Örn: 23-11 14:30)
-    now_str = datetime.now(pytz.timezone('Turkey')).strftime('%d-%m %H:%M')
+    # Tarih formatı (Kesin string olarak)
+    now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%d-%m %H:%M'))
     
-    # 1. Analyze & Sell
+    # 1. ANALİZ
     for i, (idx, row) in enumerate(updated.iterrows()):
         ticker = row['Ticker']
         try:
             df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
             if df.empty: continue
             
-            # yfinance v0.2.x fix: MultiIndex sütunları düzelt
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
             
             df = process_data(df)
             prob, winner = brain.run_tournament(df)
             
-            # Decision Thresholds
             decision = "HOLD"
             if prob > 0.55: decision = "BUY"
             elif prob < 0.45: decision = "SELL"
             
             logger.info(f"{ticker}: {decision} ({winner}) P:{prob:.2f}")
             
-            # SELL ACTION
+            # SATIŞ
             if row['Durum'] == 'COIN' and decision == "SELL":
-                current_price = df['close'].iloc[-1]
-                val = float(row['Miktar']) * current_price
+                val = float(row['Miktar']) * df['close'].iloc[-1]
                 cash += val
-                
                 updated.at[idx, 'Durum'] = 'CASH'
                 updated.at[idx, 'Miktar'] = 0.0
-                updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0 # Nakit havuza alındı
+                updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0
                 updated.at[idx, 'Son_Islem_Log'] = f"SAT ({winner})"
-                updated.at[idx, 'Son_Islem_Zamani'] = now_str # <--- Tarih Güncellemesi
+                updated.at[idx, 'Son_Islem_Zamani'] = now_str
                 
-            # BUY SIGNAL
+            # ALIM LİSTESİ
             elif row['Durum'] == 'CASH' and decision == "BUY":
-                buys.append({
-                    'idx': idx, 
-                    'price': df['close'].iloc[-1], 
-                    'weight': prob, 
-                    'winner': winner
-                })
+                buys.append({'idx':idx, 'price':df['close'].iloc[-1], 'weight':prob, 'winner':winner})
                 
-        except Exception as e: 
-            logger.error(f"Err {ticker}: {e}")
+        except Exception as e: logger.error(f"Err {ticker}: {e}")
             
-    # 2. Buy Execution
-    # Nakit varsa ve alım sinyali geldiyse
-    if buys and cash > 2.0: # Minimum 2 dolar varsa işlem yap
+    # 2. ALIM İŞLEMİ
+    if buys and cash > 2.0:
         total_w = sum([b['weight'] for b in buys])
         for b in buys:
             share = (b['weight'] / total_w) * cash
             amt = share / b['price']
-            
             updated.at[b['idx'], 'Durum'] = 'COIN'
             updated.at[b['idx'], 'Miktar'] = amt
             updated.at[b['idx'], 'Nakit_Bakiye_USD'] = 0.0
             updated.at[b['idx'], 'Son_Islem_Fiyati'] = b['price']
             updated.at[b['idx'], 'Son_Islem_Log'] = f"AL ({b['winner']})"
-            updated.at[b['idx'], 'Son_Islem_Zamani'] = now_str # <--- Tarih Güncellemesi
+            updated.at[b['idx'], 'Son_Islem_Zamani'] = now_str # TARİH GÜNCELLE
 
-    # Eğer alım yapılmadıysa ve nakit arttıysa (satışlardan), parayı kaybetmemek için
-    # İlk satıra (genelde BTC veya ana hesap) park et.
     elif cash > 0:
-        # Önce hepsini sıfırla ki mükerrer olmasın
         updated['Nakit_Bakiye_USD'] = 0.0
-        # İlk satıra tüm parayı yaz
         fidx = updated.index[0]
         updated.at[fidx, 'Nakit_Bakiye_USD'] = cash
             
-    # 3. Valuation & Save
+    # 3. DEĞERLEME
     for idx, row in updated.iterrows():
-        # Coin değerlemesi
         if row['Durum'] == 'COIN':
             try:
-                # Anlık fiyat çek
-                ticker_data = yf.download(row['Ticker'], period="1d", interval="1m", progress=False)
-                if not ticker_data.empty:
-                    # MultiIndex kontrolü
-                    if isinstance(ticker_data.columns, pd.MultiIndex):
-                        p = ticker_data['Close'].iloc[-1].iloc[0] if isinstance(ticker_data['Close'].iloc[-1], pd.Series) else ticker_data['Close'].iloc[-1]
-                    else:
-                        p = ticker_data['Close'].iloc[-1]
-                    
+                td = yf.download(row['Ticker'], period="1d", interval="1m", progress=False)
+                if not td.empty:
+                    p = td['Close'].iloc[-1]
+                    if isinstance(p, pd.Series): p = p.iloc[0]
                     updated.at[idx, 'Kaydedilen_Deger_USD'] = float(row['Miktar']) * float(p)
-            except: 
-                # Hata olursa eski değeri koru veya manuel hesapla
-                pass
-        # Nakit değerlemesi
-        else:
-            updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
+            except: pass
+        else: updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
         
+    # SON ADIM: KAYDET
     save_portfolio(updated, sheet)
-    logger.info("Bot Finished.")
