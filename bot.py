@@ -179,7 +179,13 @@ if __name__ == "__main__":
         exit()
     
     updated = pf.copy()
+    
+    # --- KRITİK DÜZELTME BAŞLANGICI ---
+    # Mevcut nakiti değişkene al ve tablodaki tüm nakitleri SIFIRLA.
     cash = updated['Nakit_Bakiye_USD'].sum()
+    updated['Nakit_Bakiye_USD'] = 0.0
+    # --- KRİTİK DÜZELTME BİTİŞİ ---
+    
     buys = []
     brain = Brain()
     
@@ -208,10 +214,10 @@ if __name__ == "__main__":
             # SATIŞ
             if row['Durum'] == 'COIN' and decision == "SELL":
                 val = float(row['Miktar']) * df['close'].iloc[-1]
-                cash += val
+                cash += val # Nakit havuza eklenir
                 updated.at[idx, 'Durum'] = 'CASH'
                 updated.at[idx, 'Miktar'] = 0.0
-                updated.at[idx, 'Nakit_Bakiye_USD'] = 0.0
+                # Nakit bakiye satırına yazılmaz, havuzda birikir.
                 updated.at[idx, 'Son_Islem_Log'] = f"SAT ({winner})"
                 updated.at[idx, 'Son_Islem_Zamani'] = now_str
                 
@@ -232,14 +238,16 @@ if __name__ == "__main__":
             updated.at[b['idx'], 'Nakit_Bakiye_USD'] = 0.0
             updated.at[b['idx'], 'Son_Islem_Fiyati'] = b['price']
             updated.at[b['idx'], 'Son_Islem_Log'] = f"AL ({b['winner']})"
-            updated.at[b['idx'], 'Son_Islem_Zamani'] = now_str # TARİH GÜNCELLE
+            updated.at[b['idx'], 'Son_Islem_Zamani'] = now_str
 
+    # 3. KALAN NAKİT YÖNETİMİ
+    # Eğer alım yapılmadıysa veya nakit arttıysa, kalan parayı ilk satıra yaz.
     elif cash > 0:
-        updated['Nakit_Bakiye_USD'] = 0.0
         fidx = updated.index[0]
-        updated.at[fidx, 'Nakit_Bakiye_USD'] = cash
+        current_cash_in_row = float(updated.at[fidx, 'Nakit_Bakiye_USD'])
+        updated.at[fidx, 'Nakit_Bakiye_USD'] = current_cash_in_row + cash
             
-    # 3. DEĞERLEME
+    # 4. DEĞERLEME
     for idx, row in updated.iterrows():
         if row['Durum'] == 'COIN':
             try:
