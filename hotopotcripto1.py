@@ -262,4 +262,117 @@ if not pf_df.empty:
     if st.button("🏆 TURNUVAYI BAŞLAT VE ANALİZ ET", type="primary"):
         updated_pf = pf_df.copy()
         
-        # --- KRİTİK D
+        # --- KRİTİK DÜZELTME BAŞLANGICI ---
+        # 1. Mevcut nakiti topla
+        pool_cash = updated_pf['Nakit_Bakiye_USD'].sum()
+        # 2. Tablodaki nakiti SIFIRLA (Çifte harcamayı önler)
+        updated_pf['Nakit_Bakiye_USD'] = 0.0
+        # --- KRİTİK DÜZELTME BİTİŞİ ---
+        
+        buy_orders = []
+        session_log = [] # İşlem geçmişi tablosu için
+        
+        brain = HedgeFundBrain()
+        prog = st.progress(0)
+        
+        for i, (idx, row) in enumerate(updated_pf.iterrows()):
+            ticker = row['Ticker']
+            df = get_data(ticker)
+            
+            if df is not None:
+                df = process_data_advanced(df)
+                res = brain.train_predict_tournament(df)
+                
+                prob = res['prob']
+                winner = res['winner']
+                
+                # Karar
+                decision = "HOLD"
+                if prob > 0.55: decision = "BUY"
+                elif prob < 0.45: decision = "SELL"
+                
+                # --- GÖRSELLEŞTİRME ---
+                with st.expander(f"{ticker} | {decision} | Kazanan: {winner} (ROI: %{res['winner_roi']:.1f})"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Güven Skoru", f"%{prob*100:.1f}")
+                    c2.metric("Volatilite (GARCH)", f"%{res['garch_vol']*100:.2f}")
+                    c3.markdown(f"**Kazanan Model:** `{winner}`")
+                    
+                    # Turnuva Grafiği
+                    fig = go.Figure()
+                    dates = res['dates']
+                    fig.add_trace(go.Scatter(x=dates, y=res['eq_ens'][1:], name='Ensemble', line=dict(color='#00CC96')))
+                    fig.add_trace(go.Scatter(x=dates, y=res['eq_solo'][1:], name='Solo XGB', line=dict(color='#636EFA', dash='dot')))
+                    fig.update_layout(title="Son 60 Gün Turnuva Performansı", height=300, margin=dict(l=0,r=0,t=30,b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # --- İŞLEM MANTIĞI ---
+                current_p = df['close'].iloc[-1]
+                
+                # SATIŞ
+                if row['Durum'] == 'COIN':
+                    if decision == "SELL":
+                        val = float(row['Miktar']) * current_p
+                        pool_cash += val # Nakit havuza eklendi
+                        updated_pf.at[idx, 'Durum'] = 'CASH'
+                        updated_pf.at[idx, 'Miktar'] = 0.0
+                        updated_pf.at[idx, 'Son_Islem_Log'] = f"SAT ({winner})"
+                        st.toast(f"🛑 {ticker} Satıldı!")
+                        session_log.append({'Zaman': datetime.now().strftime("%H:%M"), 'Ticker': ticker, 'İşlem': 'SAT', 'Fiyat': current_p, 'Detay': f"Model: {winner}"})
+                
+                # ALIM ADAYI
+                elif row['Durum'] == 'CASH':
+                    if decision == "BUY":
+                        # Volatiliteye göre pozisyon ayarla
+                        pos_scale = 0.5 if res['garch_vol'] > 0.05 else 1.0
+                        buy_orders.append({
+                            'idx': idx, 'ticker': ticker, 'price': current_p, 
+                            'weight': prob * pos_scale, 'winner': winner
+                        })
+            
+            prog.progress((i+1)/len(updated_pf))
+            
+        # --- ALIMLARI YAP ---
+        if buy_orders and pool_cash > 10:
+            total_w = sum([b['weight'] for b in buy_orders])
+            for b in buy_orders:
+                share = (b['weight'] / total_w) * pool_cash
+                amt = share / b['price']
+                
+                updated_pf.at[b['idx'], 'Durum'] = 'COIN'
+                updated_pf.at[b['idx'], 'Miktar'] = amt
+                updated_pf.at[b['idx'], 'Nakit_Bakiye_USD'] = 0.0
+                updated_pf.at[b['idx'], 'Son_Islem_Fiyati'] = b['price']
+                log_msg = f"AL ({b['winner']})"
+                updated_pf.at[b['idx'], 'Son_Islem_Log'] = log_msg
+                st.toast(f"✅ {b['ticker']} Alındı!")
+                session_log.append({'Zaman': datetime.now().strftime("%H:%M"), 'Ticker': b['ticker'], 'İşlem': 'AL', 'Fiyat': b['price'], 'Detay': f"Tutar: ${share:.1f}"})
+        
+        # --- KALAN NAKİTİ GERİ YAZ ---
+        # Eğer alım yapılmadıysa veya para arttıysa, ilk satıra geri yükle
+        elif pool_cash > 0:
+            fidx = updated_pf.index[0]
+            current_cash_in_row = float(updated_pf.at[fidx, 'Nakit_Bakiye_USD'])
+            updated_pf.at[fidx, 'Nakit_Bakiye_USD'] = current_cash_in_row + pool_cash
+                    
+        # Değerleme
+        for idx, row in updated_pf.iterrows():
+            if row['Durum'] == 'COIN':
+                try:
+                    p = yf.download(row['Ticker'], period="1d", progress=False)['Close'].iloc[-1]
+                    updated_pf.at[idx, 'Kaydedilen_Deger_USD'] = float(row['Miktar']) * float(p)
+                except: pass
+            else:
+                updated_pf.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
+        
+        save_portfolio(updated_pf, sheet)
+        
+        # --- İŞLEM GEÇMİŞİ TABLOSU ---
+        st.divider()
+        st.subheader("📝 Bu Oturumdaki İşlem Geçmişi")
+        if session_log:
+            st.table(pd.DataFrame(session_log))
+        else:
+            st.info("Bu turda herhangi bir alım/satım işlemi yapılmadı.")
+            
+        st.success("✅ Tüm analizler tamamlandı ve Google Sheets güncellendi.")
