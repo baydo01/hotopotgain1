@@ -12,9 +12,9 @@ import pytz
 # --- ML LIBS ---
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer, KNNImputer
-from sklearn.linear_model import BayesianRidge
+from sklearn.linear_model import BayesianRidge, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import accuracy_score
 import xgboost as xgb
 import plotly.express as px
@@ -22,17 +22,17 @@ import plotly.express as px
 warnings.filterwarnings("ignore")
 
 # UI CONFIG
-st.set_page_config(page_title="Hedge Fund AI: V12 Stable", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Hedge Fund AI: V13 Final", layout="wide", page_icon="🏛️")
 st.markdown("""
 <style>
     .main {background-color: #0E1117;}
-    .header-box {background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%); padding: 25px; border-radius: 12px; border-left: 5px solid #FFD700; margin-bottom: 25px;}
+    .header-box {background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%); padding: 25px; border-radius: 12px; border-left: 5px solid #00ff88; margin-bottom: 25px;}
     .header-title {font-size: 32px; font-weight: 700; color: #fff; margin:0;}
     .header-sub {font-size: 14px; color: #b0b0b0; margin-top: 5px;}
 </style>
 <div class="header-box">
-    <div class="header-title">🛡️ Hedge Fund AI: V12 (Bug Fix Edition)</div>
-    <div class="header-sub">Fixed Risk Calculation • Dynamic Volatility • Independent Coin Analysis</div>
+    <div class="header-title">🏛️ Hedge Fund AI: V13 (Final Engine)</div>
+    <div class="header-sub">Predictive Engine Restored • Risk Adjusted • Auto-Tuned Ensemble</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -70,18 +70,7 @@ def load_portfolio():
         return df, pf_sheet
     except: return pd.DataFrame(), None
 
-def log_transaction(ticker, action, amount, price, model, sheet):
-    if sheet:
-        now = datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M')
-        sheet.append_row([now, ticker, action, float(amount), float(price), model])
-
-def save_portfolio(df, sheet):
-    if sheet:
-        df_exp = df.copy().astype(str)
-        sheet.clear()
-        sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
-
-# --- FEATURES ---
+# --- FEATURES & ML (Same as Bot) ---
 def add_technical_indicators(df):
     df = df.copy()
     delta = df['close'].diff()
@@ -89,11 +78,13 @@ def add_technical_indicators(df):
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
+    
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
+    
     df['sma_20'] = df['close'].rolling(20).mean()
     df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
     return df
@@ -107,7 +98,7 @@ def get_data(ticker):
         return df
     except: return None
 
-def prepare_features_v12(df):
+def prepare_features(df):
     df = df.copy().replace([np.inf, -np.inf], np.nan)
     df = add_technical_indicators(df)
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
@@ -119,7 +110,6 @@ def prepare_features_v12(df):
     hist = df.iloc[:-1].copy()
     return hist, future
 
-# --- IMPUTATION LAB ---
 class ImputationLab:
     def baydo_impute(self, df):
         filled = df.copy()
@@ -135,37 +125,34 @@ class ImputationLab:
         filled[num_cols] = filled[num_cols].fillna(base)
         return filled.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
 
-    def apply_imputation(self, df_train, df_val, method):
+    def apply_imputation(self, df_train, df_test, method):
         features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
         features = [f for f in features if f in df_train.columns]
-        X_tr = df_train[features].copy()
-        X_val = df_val[features].copy()
+        X_tr = df_train[features].copy(); X_te = df_test[features].copy()
+        
         if method == 'Baydo':
-            X_tr = self.baydo_impute(X_tr)
-            X_val = self.baydo_impute(X_val)
+            X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
         elif method == 'MICE':
             try:
                 imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
                 X_tr = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
-                X_val = pd.DataFrame(imp.transform(X_val), columns=features, index=X_val.index)
-            except: 
-                X_tr = self.baydo_impute(X_tr); X_val = self.baydo_impute(X_val)
+                X_te = pd.DataFrame(imp.transform(X_te), columns=features, index=X_te.index)
+            except: X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
         elif method == 'KNN':
             try:
                 imp = KNNImputer(n_neighbors=5)
                 X_tr = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
-                X_val = pd.DataFrame(imp.transform(X_val), columns=features, index=X_val.index)
-            except:
-                X_tr = self.baydo_impute(X_tr); X_val = self.baydo_impute(X_val)
+                X_te = pd.DataFrame(imp.transform(X_te), columns=features, index=X_te.index)
+            except: X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
         else:
             X_tr = X_tr.interpolate(method='linear').fillna(0)
-            X_val = X_val.interpolate(method='linear').fillna(0)
+            X_te = X_te.interpolate(method='linear').fillna(0)
+            
         scaler = RobustScaler()
         X_tr_s = pd.DataFrame(scaler.fit_transform(X_tr), columns=features, index=X_tr.index)
-        X_val_s = pd.DataFrame(scaler.transform(X_val), columns=features, index=X_val.index)
-        return X_tr_s, X_val_s, scaler
+        X_te_s = pd.DataFrame(scaler.transform(X_te), columns=features, index=X_te.index)
+        return X_tr_s, X_te_s, scaler
 
-# --- BRAIN ---
 class GrandLeagueBrain:
     def __init__(self):
         self.lab = ImputationLab()
@@ -206,16 +193,15 @@ class GrandLeagueBrain:
                 if m_xgb:
                     p = (rf.predict_proba(X_val)[:,1]*0.3 + et.predict_proba(X_val)[:,1]*0.3 + m_xgb.predict_proba(X_val)[:,1]*0.4)
                     scores_ens.append(accuracy_score(y_val, (p>0.5).astype(int)))
-            X_full, _, scaler = self.lab.apply_imputation(df, df.iloc[-5:], imp)
-            final_xgb = self.tune_xgboost(X_full, df['target'])
+            
             avg_x = np.mean(scores_xgb) if scores_xgb else 0
-            strategies.append({'name': f"{imp} + XGB", 'type': 'XGB', 'score': avg_x, 'model': final_xgb, 'scaler': scaler, 'imputer_name': imp})
+            strategies.append({'name': f"{imp} + XGB", 'type': 'XGB', 'score': avg_x, 'imputer_name': imp})
             avg_e = np.mean(scores_ens) if scores_ens else 0
-            strategies.append({'name': f"{imp} + ENS", 'type': 'ENS', 'score': avg_e, 'model': 'ENS_OBJ', 'scaler': scaler, 'imputer_name': imp})
+            strategies.append({'name': f"{imp} + ENS", 'type': 'ENS', 'score': avg_e, 'imputer_name': imp})
         winner = max(strategies, key=lambda x: x['score'])
         return winner, strategies
 
-# --- UI EXECUTION ---
+# --- EXECUTION ---
 pf_df, sheet_pf = load_portfolio()
 _, sheet_hist = connect_sheet_services()
 
@@ -225,55 +211,62 @@ if not pf_df.empty:
     with tab1:
         st.metric("Total Portfolio", f"${pf_df['Nakit_Bakiye_USD'].sum() + pf_df[pf_df['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum():.2f}")
         if st.button("🔥 START ANALYSIS", type="primary"):
-            updated_pf = pf_df.copy()
             brain = GrandLeagueBrain()
-            
             tickers, scores, vols, sizes = [], [], [], []
             prog = st.progress(0)
             
-            for i, (idx, row) in enumerate(updated_pf.iterrows()):
+            for i, (idx, row) in enumerate(pf_df.iterrows()):
                 ticker = row['Ticker']
                 df = get_data(ticker)
                 if df is not None and len(df) > 200:
-                    hist, future = prepare_features_v12(df)
+                    hist, future = prepare_features(df)
                     winner, table = brain.run_league(hist)
                     
-                    current_volatility = hist['volatility_measure'].iloc[-1]
+                    # --- RESTORED PREDICTION ENGINE ---
+                    # 1. Full Train Data Prep
+                    X_full, X_future_scaled, _ = brain.lab.apply_imputation(hist, future, winner['imputer_name'])
+                    y_full = hist['target']
+                    
+                    # 2. Retrain Winner & Predict
+                    if winner['type'] == 'XGB':
+                        model = brain.tune_xgboost(X_full, y_full)
+                        prob = model.predict_proba(X_future_scaled)[:,1][0]
+                    else: # ENS
+                        m_xgb = brain.tune_xgboost(X_full, y_full)
+                        rf = RandomForestClassifier(50, max_depth=5, n_jobs=1).fit(X_full, y_full)
+                        et = ExtraTreesClassifier(50, max_depth=5, n_jobs=1).fit(X_full, y_full)
+                        p1 = rf.predict_proba(X_future_scaled)[:,1]
+                        p2 = et.predict_proba(X_future_scaled)[:,1]
+                        p3 = m_xgb.predict_proba(X_future_scaled)[:,1]
+                        prob = (p1*0.3 + p2*0.3 + p3*0.4)[0]
+                    
+                    # Risk Logic
+                    vol = hist['volatility_measure'].iloc[-1]
                     target_vol = 0.04
-                    if current_volatility == 0 or np.isnan(current_volatility):
-                        risk_factor = 1.0
-                    else:
-                        risk_factor = np.clip(target_vol / current_volatility, 0.3, 2.0)
+                    if vol==0 or np.isnan(vol): risk_factor = 1.0
+                    else: risk_factor = np.clip(target_vol / vol, 0.3, 2.0)
                     
-                    tickers.append(ticker)
-                    scores.append(winner['score']*100)
-                    vols.append(current_volatility*100)
-                    sizes.append(risk_factor)
+                    # Decision
+                    if prob > 0.58: signal = "BUY"
+                    elif prob < 0.42: signal = "SELL"
+                    else: signal = "HOLD"
                     
-                    with st.expander(f"{ticker} | {winner['name']} (Acc: %{winner['score']*100:.1f})"):
+                    # Visualize
+                    tickers.append(ticker); scores.append(winner['score']*100); vols.append(vol*100); sizes.append(risk_factor)
+                    with st.expander(f"{ticker} | {signal} | {winner['name']} (Prob: {prob:.2f})"):
                         c1, c2, c3 = st.columns(3)
-                        c1.metric("Model Acc", f"%{winner['score']*100:.1f}")
-                        c2.metric("Market Volatility", f"%{current_volatility*100:.2f}")
-                        c3.metric("Size Multiplier", f"{risk_factor:.2f}x")
+                        c1.metric("Validation Acc", f"%{winner['score']*100:.1f}")
+                        c2.metric("Probability", f"%{prob*100:.1f}")
+                        c3.metric("Risk Factor", f"{risk_factor:.2f}x")
                         st.dataframe(pd.DataFrame(table)[['name', 'score']].sort_values('score', ascending=False).head(3))
+                        if signal == "BUY": st.success(f"🟢 STRONG BUY SIGNAL (Adjusted Size: {risk_factor:.2f}x)")
+                        elif signal == "SELL": st.error("🔴 SELL SIGNAL")
                         
-                prog.progress((i+1)/len(updated_pf))
-            
-            # --- PLOTLY SCATTER ---
-            viz_df = pd.DataFrame({
-                'Ticker': tickers,
-                'Model Acc (%)': scores,
-                'Volatility (%)': vols,
-                'Size Multiplier': sizes
-            })
-            fig = px.scatter(
-                viz_df, x='Volatility (%)', y='Model Acc (%)',
-                size='Size Multiplier', color='Ticker',
-                hover_data=['Ticker', 'Size Multiplier', 'Volatility (%)'],
-                title="📊 Portfolio Analysis: Risk vs Model Accuracy"
-            )
+                prog.progress((i+1)/len(pf_df))
+                
+            viz_df = pd.DataFrame({'Ticker': tickers, 'Model Acc (%)': scores, 'Volatility (%)': vols, 'Size Multiplier': sizes})
+            fig = px.scatter(viz_df, x='Volatility (%)', y='Model Acc (%)', size='Size Multiplier', color='Ticker', title="📊 Risk vs Accuracy Map")
             st.plotly_chart(fig, use_container_width=True)
-            
             st.success("Analysis Complete.")
 
     with tab2: st.dataframe(pf_df)
