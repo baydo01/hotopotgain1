@@ -16,25 +16,23 @@ from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression, BayesianRidge
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
-from hmmlearn.hmm import GaussianHMM
 import xgboost as xgb
 import plotly.graph_objects as go
 
 warnings.filterwarnings("ignore")
 
 # UI CONFIG
-st.set_page_config(page_title="Hedge Fund AI: V9 Baybebek", layout="wide", page_icon="👶")
+st.set_page_config(page_title="Hedge Fund AI: V10 Chronos", layout="wide", page_icon="⏳")
 st.markdown("""
 <style>
     .main {background-color: #0E1117;}
-    .header-box {background: linear-gradient(135deg, #1A2980 0%, #26D0CE 100%); padding: 25px; border-radius: 12px; border-left: 5px solid #FFD700; margin-bottom: 25px;}
+    .header-box {background: linear-gradient(135deg, #43cea2 0%, #185a9d 100%); padding: 25px; border-radius: 12px; border-left: 5px solid #fff; margin-bottom: 25px;}
     .header-title {font-size: 32px; font-weight: 700; color: #fff; margin:0;}
-    .header-sub {font-size: 14px; color: #e0e0e0; margin-top: 5px;}
-    .metric-card {background-color: #1e2126; padding: 10px; border-radius: 8px; border: 1px solid #333;}
+    .header-sub {font-size: 14px; color: #f0f0f0; margin-top: 5px;}
 </style>
 <div class="header-box">
-    <div class="header-title">👶 Hedge Fund AI: V9 (Grand League)</div>
-    <div class="header-sub">Baybebek Imputation • Cartesian Product Optimization • Train/Val/Test Split</div>
+    <div class="header-title">⏳ Hedge Fund AI: V10 (Chronos Edition)</div>
+    <div class="header-sub">BaydoImputation v2 • Walk-Forward Validation • Static Validation • Grand League</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -94,14 +92,8 @@ def get_data(ticker):
     except: return None
 
 def prepare_raw_features(df):
-    """
-    Ham featureları üretir ama NaN'ları doldurmaz. 
-    Imputation daha sonra Train/Val split üzerinde yapılacak.
-    """
     df = df.copy()
     df = df.replace([np.inf, -np.inf], np.nan)
-    
-    # Teknik İndikatörler
     df['kalman'] = df['close'].rolling(3).mean()
     df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
     df['ret'] = df['close'].pct_change()
@@ -109,297 +101,221 @@ def prepare_raw_features(df):
     df['range_vol_delta'] = df['range'].pct_change(5)
     df['heuristic'] = (np.sign(df['close'].pct_change(5)) + np.sign(df['close'].pct_change(30)))/2.0
     
-    # Historical
+    # Volatility for Baydo
+    df['volatility'] = df['close'].pct_change().rolling(window=10).std()
+    
     df['avg_ret_5m'] = df['ret'].rolling(100).mean()*100
     df['avg_ret_3y'] = df['ret'].rolling(750).mean()*100
-    
-    # Target (Shifted Close)
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     
-    # Son satırı (gelecek) tut, ama eğitimden çıkar
     future_row = df.iloc[[-1]].copy()
     df_historic = df.iloc[:-1].copy()
-    
     return df_historic, future_row
 
-# --- IMPUTATION METHODS ---
+# --- IMPUTATION LAB (Baydo v2) ---
 class ImputationLab:
-    def baybebek_impute(self, df):
-        """
-        Baybebek Tekniği: n. nokta boşsa, (n-2, n-1, n+1, n+2) ortalamasıyla doldur.
-        Rolling window=5, center=True kullanır.
-        """
+    def baydo_impute(self, df):
         filled = df.copy()
         numeric_cols = filled.select_dtypes(include=[np.number]).columns
-        # min_periods=1: Komşulardan en az 1 tanesi doluysa hesapla
-        rolling_means = filled[numeric_cols].rolling(window=5, center=True, min_periods=1).mean()
-        filled[numeric_cols] = filled[numeric_cols].fillna(rolling_means)
-        # Hala boş kalan varsa (en uçlar) linear yap
-        filled = filled.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
-        return filled
+        
+        # 1. Rolling Means
+        roll_fast = filled[numeric_cols].rolling(window=3, center=True, min_periods=1).mean()
+        roll_mid  = filled[numeric_cols].rolling(window=5, center=True, min_periods=1).mean()
+        roll_slow = filled[numeric_cols].rolling(window=9, center=True, min_periods=1).mean()
+        
+        # 2. Volatility Mask
+        vol_filled = filled['volatility'].interpolate(method='linear').fillna(method='bfill')
+        vol_high = vol_filled.quantile(0.66)
+        vol_low = vol_filled.quantile(0.33)
+        
+        final_fill = roll_mid.copy()
+        mask_high = vol_filled > vol_high; final_fill[mask_high] = roll_fast[mask_high]
+        mask_low = vol_filled < vol_low; final_fill[mask_low] = roll_slow[mask_low]
+        
+        filled[numeric_cols] = filled[numeric_cols].fillna(final_fill)
+        return filled.interpolate(method='linear').fillna(method='bfill') # Fallback
 
-    def apply_imputation(self, df_train, df_val, method):
-        """Train verisine fit et, Val verisini transform et (Data Leakage Önleme)"""
-        # Sütunlar
+    def apply_imputation(self, df_train, df_test, method):
         features = ['log_ret', 'range', 'heuristic', 'range_vol_delta', 'avg_ret_5m', 'avg_ret_3y']
+        X_tr = df_train[features].copy()
+        X_te = df_test[features].copy()
         
-        # Sadece feature sütunlarını al, diğerlerini koru
-        X_train = df_train[features].copy()
-        X_val = df_val[features].copy()
-        
-        # Method Seçimi
-        if method == 'Baybebek':
-            X_train_filled = self.baybebek_impute(X_train)
-            X_val_filled = self.baybebek_impute(X_val)
-            
+        if method == 'Baydo':
+            X_tr = self.baydo_impute(df_train)[features]
+            X_te = self.baydo_impute(df_test)[features]
         elif method == 'MICE':
             try:
                 imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
-                X_train_filled = pd.DataFrame(imp.fit_transform(X_train), columns=features, index=X_train.index)
-                X_val_filled = pd.DataFrame(imp.transform(X_val), columns=features, index=X_val.index)
-            except: # Hata durumunda Baybebek'e düş
-                X_train_filled = self.baybebek_impute(X_train)
-                X_val_filled = self.baybebek_impute(X_val)
-
-        elif method == 'KNN':
-            try:
-                imp = KNNImputer(n_neighbors=5)
-                X_train_filled = pd.DataFrame(imp.fit_transform(X_train), columns=features, index=X_train.index)
-                X_val_filled = pd.DataFrame(imp.transform(X_val), columns=features, index=X_val.index)
-            except:
-                X_train_filled = self.baybebek_impute(X_train)
-                X_val_filled = self.baybebek_impute(X_val)
-                
-        else: # Linear (Fallback)
-            X_train_filled = X_train.interpolate(method='linear').fillna(0)
-            X_val_filled = X_val.interpolate(method='linear').fillna(0)
+                X_tr = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
+                X_te = pd.DataFrame(imp.transform(X_te), columns=features, index=X_te.index)
+            except: 
+                X_tr = self.baydo_impute(df_train)[features]
+                X_te = self.baydo_impute(df_test)[features]
+        elif method == 'Linear':
+            X_tr = X_tr.interpolate(method='linear').fillna(0)
+            X_te = X_te.interpolate(method='linear').fillna(0)
             
-        # Doldurulmuş dataları geri birleştir
-        df_train_out = df_train.copy(); df_train_out[features] = X_train_filled
-        df_val_out = df_val.copy(); df_val_out[features] = X_val_filled
-        
-        return df_train_out, df_val_out
+        return X_tr, X_te
 
-# --- MODEL TRAINING & LEAGUE ---
+# --- GRAND LEAGUE ---
 class GrandLeagueBrain:
     def __init__(self):
-        self.meta_model = LogisticRegression(C=1.0)
         self.lab = ImputationLab()
+        self.features = ['log_ret', 'range', 'heuristic', 'range_vol_delta', 'avg_ret_5m', 'avg_ret_3y']
         
-    def train_xgboost(self, X_tr, y_tr, X_val, y_val):
-        # Hızlı Grid Search
-        best_score = -1; best_model = None
+    def train_models(self, X_tr, y_tr):
+        best_xgb, best_s = None, -1
         for d in [3, 5]:
-            for lr in [0.05, 0.1]:
-                m = xgb.XGBClassifier(n_estimators=100, max_depth=d, learning_rate=lr, random_state=42, n_jobs=1)
-                m.fit(X_tr, y_tr)
-                preds = m.predict(X_val)
-                acc = accuracy_score(y_val, preds)
-                if acc > best_score:
-                    best_score = acc
-                    best_model = m
-        return best_model, best_score
-
-    def train_ensemble(self, X_tr, y_tr, X_val, y_val):
-        # Base Models
+            m = xgb.XGBClassifier(n_estimators=80, max_depth=d, learning_rate=0.1, n_jobs=1, random_state=42)
+            m.fit(X_tr, y_tr)
+            s = m.score(X_tr, y_tr)
+            if s > best_s: best_xgb = m; best_s = s
+        
         rf = RandomForestClassifier(n_estimators=50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
         etc = ExtraTreesClassifier(n_estimators=50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
-        xgb_m = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, n_jobs=1).fit(X_tr, y_tr)
-        
-        # Meta Features
-        meta_tr = pd.DataFrame({'RF': rf.predict_proba(X_tr)[:,1], 'ETC': etc.predict_proba(X_tr)[:,1], 'XGB': xgb_m.predict_proba(X_tr)[:,1]})
-        meta_val = pd.DataFrame({'RF': rf.predict_proba(X_val)[:,1], 'ETC': etc.predict_proba(X_val)[:,1], 'XGB': xgb_m.predict_proba(X_val)[:,1]})
-        
-        lr = LogisticRegression().fit(meta_tr, y_tr)
-        preds = lr.predict(meta_val)
-        acc = accuracy_score(y_val, preds)
-        
-        return (rf, etc, xgb_m, lr), acc
+        return best_xgb, (rf, etc, best_xgb)
+
+    def predict_ens(self, models, X):
+        rf, etc, xg = models
+        return (rf.predict_proba(X)[:,1] + etc.predict_proba(X)[:,1] + xg.predict_proba(X)[:,1]) / 3
 
     def run_grand_league(self, df):
-        """
-        Kombinasyon Ligi:
-        (MICE, KNN, Linear, Baybebek) x (XGBoost, Ensemble)
-        Train/Val split üzerinde en iyiyi seçer.
-        """
-        # 1. SPLIT (Zaman Serisi Olduğu için Shuffle=False)
-        train_size = int(len(df) * 0.70)
-        val_size = int(len(df) * 0.15)
+        impute_methods = ['Baydo', 'MICE', 'Linear']
+        strategies = []
         
-        df_train = df.iloc[:train_size].copy()
-        df_val = df.iloc[train_size : train_size+val_size].copy()
-        df_test = df.iloc[train_size+val_size:].copy() # Test seti final sınavı
+        # A. STATIC
+        split = int(len(df)*0.85)
+        df_tr_s, df_val_s = df.iloc[:split], df.iloc[split:]
         
-        features = ['log_ret', 'range', 'heuristic', 'range_vol_delta', 'avg_ret_5m', 'avg_ret_3y']
-        impute_methods = ['Baybebek', 'MICE', 'KNN', 'Linear']
-        
-        league_table = []
-        
-        # 2. TOURNAMENT LOOP
-        for imp_name in impute_methods:
-            # Impute (Train fit, Val transform)
-            d_tr, d_val = self.lab.apply_imputation(df_train, df_val, imp_name)
+        for imp in impute_methods:
+            X_tr, X_val = self.lab.apply_imputation(df_tr_s, df_val_s, imp)
+            y_tr, y_val = df_tr_s['target'], df_val_s['target']
             
-            # Veri Hazırlığı
-            X_tr, y_tr = d_tr[features], d_tr['target']
-            X_v, y_v = d_val[features], d_val['target']
+            mx, me = self.train_models(X_tr, y_tr)
+            strategies.append({'mode':'Static', 'imp':imp, 'type':'XGB', 'm':mx, 'score':accuracy_score(y_val, mx.predict(X_val))})
+            strategies.append({'mode':'Static', 'imp':imp, 'type':'ENS', 'm':me, 'score':accuracy_score(y_val, (self.predict_ens(me, X_val)>0.5).astype(int))})
             
-            # A. XGBoost
-            model_xgb, acc_xgb = self.train_xgboost(X_tr, y_tr, X_v, y_v)
-            league_table.append({
-                'combo': f"{imp_name} + XGBoost",
-                'imputer': imp_name, 'model_type': 'XGB',
-                'model': model_xgb, 'acc': acc_xgb
-            })
+        # B. WALK-FORWARD
+        wf_steps = 4; wf_win = 30
+        for imp in impute_methods:
+            sx, se = [], []
+            for i in range(wf_steps):
+                te_end = len(df) - (i*wf_win); te_st = te_end - wf_win
+                if i==0: te_end = len(df)
+                tr_end = te_st
+                if tr_end < 200: break
+                
+                d_tr = df.iloc[:tr_end]; d_val = df.iloc[tr_end:te_end]
+                X_tr, X_val = self.lab.apply_imputation(d_tr, d_val, imp)
+                y_tr, y_val = d_tr['target'], d_val['target']
+                
+                mx, me = self.train_models(X_tr, y_tr)
+                sx.append(accuracy_score(y_val, mx.predict(X_val)))
+                se.append(accuracy_score(y_val, (self.predict_ens(me, X_val)>0.5).astype(int)))
+                
+            X_f, _ = self.lab.apply_imputation(df, df.iloc[-5:], imp)
+            fx, fe = self.train_models(X_f, df['target'])
+            strategies.append({'mode':'Walk-Fwd', 'imp':imp, 'type':'XGB', 'm':fx, 'score':np.mean(sx) if sx else 0})
+            strategies.append({'mode':'Walk-Fwd', 'imp':imp, 'type':'ENS', 'm':fe, 'score':np.mean(se) if se else 0})
             
-            # B. Ensemble
-            model_ens, acc_ens = self.train_ensemble(X_tr, y_tr, X_v, y_v)
-            league_table.append({
-                'combo': f"{imp_name} + Ensemble",
-                'imputer': imp_name, 'model_type': 'ENS',
-                'model': model_ens, 'acc': acc_ens
-            })
-            
-        # 3. WINNER SELECTION
-        # Accuracy'ye göre sırala
-        league_table.sort(key=lambda x: x['acc'], reverse=True)
-        winner = league_table[0]
+        strategies.sort(key=lambda x: x['score'], reverse=True)
+        winner = strategies[0]
         
-        # 4. FINAL PREDICTION (TEST SET & FUTURE)
-        # Kazanan strateji ile Test ve Future verisini hazırla
-        # Not: Final prediction için tüm veriyi (Train+Val) impute etmek daha doğru olur ama
-        # tutarlılık için kazanan imputer mantığını test setine uygulayacağız.
+        # Test Curve for Winner
+        if winner['mode'] == 'Static':
+            _, X_test_viz = self.lab.apply_imputation(df_tr_s, df_val_s, winner['imp'])
+            rets = df_val_s['close'].pct_change().fillna(0).values
+            dates = df_val_s.index
+        else:
+             # Walk forward görselleştirmesi zor, son parçayı gösterelim
+             _, X_test_viz = self.lab.apply_imputation(df.iloc[:-30], df.iloc[-30:], winner['imp'])
+             rets = df.iloc[-30:]['close'].pct_change().fillna(0).values
+             dates = df.iloc[-30:].index
+             
+        if winner['type'] == 'XGB': probs = winner['m'].predict_proba(X_test_viz)[:,1]
+        else: probs = self.predict_ens(winner['m'], X_test_viz)
         
-        # Test seti imputasyonu (Sadece transform gibi düşünelim ama Baybebek stateless olduğu için direkt uygulanır)
-        df_combined = pd.concat([df_train, df_val])
-        d_combined_filled, d_test_filled = self.lab.apply_imputation(df_combined, df_test, winner['imputer'])
-        
-        # Kazanan modeli (XGB veya Ens) kullanarak tahmin üret
-        X_test = d_test_filled[features]
-        
-        if winner['model_type'] == 'XGB':
-            probs = winner['model'].predict_proba(X_test)[:, 1]
-        else: # ENS
-            rf, etc, xg, lr = winner['model']
-            meta_test = pd.DataFrame({
-                'RF': rf.predict_proba(X_test)[:,1], 
-                'ETC': etc.predict_proba(X_test)[:,1], 
-                'XGB': xg.predict_proba(X_test)[:,1]
-            })
-            probs = lr.predict_proba(meta_test)[:, 1]
-            
-        # Simülasyon (ROI Hesabı)
-        sim = 100.0
-        eq_curve = [100.0]
-        rets = d_test_filled['close'].pct_change().fillna(0).values
+        sim = 100.0; eq = [100.0]
         for i in range(len(probs)):
-            if probs[i] > 0.55: sim *= (1+rets[i])
-            eq_curve.append(sim)
+            if probs[i]>0.55: sim *= (1+rets[i])
+            eq.append(sim)
             
-        final_prob = probs[-1]
-        
-        return {
-            'winner_combo': winner['combo'],
-            'acc': winner['acc'],
-            'prob': final_prob,
-            'roi': sim - 100,
-            'equity': eq_curve,
-            'dates': df_test.index,
-            'league_table': league_table
-        }
+        return {'winner': winner, 'roi': sim-100, 'eq': eq, 'dates': dates, 'table': strategies}
 
-# --- MAIN UI ---
+# --- UI ---
 pf_df, sheet_pf = load_portfolio()
 _, sheet_hist = connect_sheet_services()
 
-tab1, tab2, tab3 = st.tabs(["🏆 Grand League (Bot Kontrol)", "📑 Canlı Veri", "📜 Geçmiş Kayıtları"])
+tab1, tab2, tab3 = st.tabs(["⏳ Chronos (Bot)", "📑 Veri", "📜 Loglar"])
 
 if not pf_df.empty:
     with tab1:
         st.metric("Toplam Varlık", f"${pf_df['Nakit_Bakiye_USD'].sum() + pf_df[pf_df['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum():.2f}")
-        
-        if st.button("⚽ LİGİ BAŞLAT (Train/Val/Test + Impute)", type="primary"):
+        if st.button("🚀 ZAMAN YOLCULUĞUNU BAŞLAT", type="primary"):
             updated_pf = pf_df.copy()
-            pool_cash = updated_pf['Nakit_Bakiye_USD'].sum()
-            updated_pf['Nakit_Bakiye_USD'] = 0.0
-            
+            pool_cash = updated_pf['Nakit_Bakiye_USD'].sum(); updated_pf['Nakit_Bakiye_USD'] = 0.0
             brain = GrandLeagueBrain()
             buy_orders = []
             
             prog = st.progress(0)
             for i, (idx, row) in enumerate(updated_pf.iterrows()):
                 ticker = row['Ticker']
-                raw_data = get_data(ticker)
-                
-                if raw_data is not None and len(raw_data) > 200:
-                    # 1. Ham Veriyi Hazırla (Boşluklarla)
-                    df_hist, df_future = prepare_raw_features(raw_data)
+                df = get_data(ticker)
+                if df is not None:
+                    df_h, df_f = prepare_raw_features(df)
+                    res = brain.run_grand_league(df_h)
+                    winner = res['winner']
                     
-                    # 2. Ligi Başlat
-                    res = brain.run_grand_league(df_hist)
+                    # Final Prediction
+                    lookback = pd.concat([df_h.iloc[-50:], df_f])
+                    lab = ImputationLab()
+                    if winner['imp'] == 'Baydo': filled = lab.baydo_impute(lookback)
+                    elif winner['imp'] == 'Linear': filled = lookback.interpolate(method='linear').fillna(method='bfill')
+                    else: 
+                        imp = KNNImputer(n_neighbors=5); nc = lookback.select_dtypes(include=[np.number]).columns
+                        filled = lookback.copy(); filled[nc] = imp.fit_transform(lookback[nc])
+                        
+                    X_fin = filled[brain.features].iloc[[-1]]
+                    if winner['type'] == 'XGB': prob = winner['m'].predict_proba(X_fin)[:,1][0]
+                    else: prob = brain.predict_ens(winner['m'], X_fin)[0]
                     
                     decision = "HOLD"
-                    if res['prob'] > 0.55: decision = "BUY"
-                    elif res['prob'] < 0.45: decision = "SELL"
+                    if prob > 0.55: decision = "BUY"
+                    elif prob < 0.45: decision = "SELL"
                     
-                    # --- UI GÖSTERİMİ ---
-                    with st.expander(f"{ticker} | {decision} | {res['winner_combo']} (Val Acc: %{res['acc']*100:.1f})"):
-                        c1, c2 = st.columns([1, 2])
-                        with c1:
-                            st.markdown("### 🏅 Kazanan")
-                            st.info(f"**{res['winner_combo']}**")
-                            st.metric("Validation Başarısı", f"%{res['acc']*100:.1f}")
-                            st.metric("Tahmini ROI (Test)", f"%{res['roi']:.1f}")
-                            
-                            st.markdown("#### 📊 Lig Sıralaması (Top 3)")
-                            for rank, team in enumerate(res['league_table'][:3]):
-                                st.caption(f"{rank+1}. {team['combo']} (Acc: %{team['acc']*100:.1f})")
-                                
-                        with c2:
-                            st.markdown("### 📈 Test Performansı")
-                            fig = go.Figure()
-                            # Daha okunabilir grafik
-                            fig.add_trace(go.Scatter(
-                                x=res['dates'], y=res['equity'], 
-                                mode='lines', name='Model Bakiye',
-                                line=dict(color='#00ff88', width=3)
-                            ))
-                            fig.update_layout(
-                                template="plotly_dark", 
-                                margin=dict(l=0,r=0,t=0,b=0),
-                                height=250,
-                                yaxis_title="Bakiye ($)",
-                                showlegend=True
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                    current_p = raw_data['close'].iloc[-1]
-                    model_desc = f"{res['winner_combo']} (Acc:{res['acc']:.2f})"
+                    with st.expander(f"{ticker} | {decision} | {winner['mode']} {winner['imp']} (Acc: %{winner['score']*100:.1f})"):
+                        c1, c2 = st.columns(2)
+                        c1.markdown(f"**Yöntem:** `{winner['mode']}` + `{winner['imp']}`")
+                        c1.markdown(f"**Model:** `{winner['type']}`")
+                        c1.metric("Score", f"%{winner['score']*100:.1f}")
+                        
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(y=res['eq'], mode='lines', name='Equity', line=dict(color='#00ff88')))
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.dataframe(pd.DataFrame(res['table']).head(5))
+                        
+                    current_p = df['close'].iloc[-1]
+                    m_desc = f"{winner['mode']}|{winner['imp']}|{winner['type']}"
                     
-                    # İŞLEM MANTIĞI
                     if row['Durum']=='COIN' and decision=="SELL":
                         pool_cash += float(row['Miktar']) * current_p
                         updated_pf.at[idx,'Durum']='CASH'; updated_pf.at[idx,'Miktar']=0.0
-                        log_transaction(ticker, "SAT", row['Miktar'], current_p, model_desc, sheet_hist)
-                        
+                        log_transaction(ticker, "SAT", row['Miktar'], current_p, m_desc, sheet_hist)
                     elif row['Durum']=='CASH' and decision=="BUY":
-                        buy_orders.append({'idx':idx, 'ticker':ticker, 'p':current_p, 'w':res['prob'], 'm':model_desc})
-                        
+                        buy_orders.append({'idx':idx, 'ticker':ticker, 'p':current_p, 'w':prob, 'm':m_desc})
                 prog.progress((i+1)/len(updated_pf))
-                
-            # ALIMLAR
+            
             if buy_orders and pool_cash > 5:
-                total_w = sum([b['w'] for b in buy_orders])
+                tw = sum([b['w'] for b in buy_orders])
                 for b in buy_orders:
-                    share = (b['w']/total_w)*pool_cash; amt = share/b['p']
+                    s = (b['w']/tw)*pool_cash; amt = s/b['p']
                     updated_pf.at[b['idx'],'Durum']='COIN'; updated_pf.at[b['idx'],'Miktar']=amt
                     updated_pf.at[b['idx'],'Nakit_Bakiye_USD']=0.0
                     log_transaction(b['ticker'], "AL", amt, b['p'], b['m'], sheet_hist)
             elif pool_cash > 0: updated_pf.at[updated_pf.index[0], 'Nakit_Bakiye_USD'] += pool_cash
-            
             save_portfolio(updated_pf, sheet_pf)
-            st.success("Büyük Lig Tamamlandı! Baybebek ve Rakipleri Analiz Edildi.")
-
+            st.success("Zaman Yolculuğu Tamamlandı!")
+    
     with tab2: st.dataframe(pf_df)
     with tab3: 
         if sheet_hist: st.dataframe(pd.DataFrame(sheet_hist.get_all_records()).iloc[::-1])
