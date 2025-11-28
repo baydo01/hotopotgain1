@@ -12,12 +12,12 @@ import pytz
 # --- ML LIBS ---
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer, KNNImputer
-from sklearn.linear_model import BayesianRidge, LogisticRegression
+from sklearn.linear_model import BayesianRidge
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import accuracy_score
 import xgboost as xgb
-import plotly.graph_objects as go
+import plotly.express as px
 
 warnings.filterwarnings("ignore")
 
@@ -84,21 +84,16 @@ def save_portfolio(df, sheet):
 # --- FEATURES ---
 def add_technical_indicators(df):
     df = df.copy()
-    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    
-    # ATR (Fixed Calculation)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
-    
-    # SMA
     df['sma_20'] = df['close'].rolling(20).mean()
     df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
     return df
@@ -115,48 +110,36 @@ def get_data(ticker):
 def prepare_features_v12(df):
     df = df.copy().replace([np.inf, -np.inf], np.nan)
     df = add_technical_indicators(df)
-    
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     df['range'] = (df['high'] - df['low']) / df['close']
-    # Volatiliteyi yüzdesel olarak hesapla (Fix: 0.50x bug)
     df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
-    
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-    
-    # NaN temizliği (Başlangıçtaki rolling NaN'ları temizle)
     df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
-    
     future = df.iloc[[-1]].copy()
     hist = df.iloc[:-1].copy()
     return hist, future
 
-# --- IMPUTATION LAB (Baydo v2) ---
+# --- IMPUTATION LAB ---
 class ImputationLab:
     def baydo_impute(self, df):
         filled = df.copy()
         num_cols = filled.select_dtypes(include=[np.number]).columns
-        
         vol = filled['volatility_measure'].interpolate(method='linear').fillna(method='bfill')
         v_high = vol.quantile(0.7); v_low = vol.quantile(0.3)
-        
         r_fast = filled[num_cols].rolling(3, center=True, min_periods=1).mean()
         r_mid = filled[num_cols].rolling(5, center=True, min_periods=1).mean()
         r_slow = filled[num_cols].rolling(9, center=True, min_periods=1).mean()
-        
         base = r_mid.copy()
         base[vol > v_high] = r_fast[vol > v_high]
         base[vol < v_low] = r_slow[vol < v_low]
-        
         filled[num_cols] = filled[num_cols].fillna(base)
         return filled.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
 
     def apply_imputation(self, df_train, df_val, method):
         features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
         features = [f for f in features if f in df_train.columns]
-        
         X_tr = df_train[features].copy()
         X_val = df_val[features].copy()
-        
         if method == 'Baydo':
             X_tr = self.baydo_impute(X_tr)
             X_val = self.baydo_impute(X_val)
@@ -177,7 +160,6 @@ class ImputationLab:
         else:
             X_tr = X_tr.interpolate(method='linear').fillna(0)
             X_val = X_val.interpolate(method='linear').fillna(0)
-            
         scaler = RobustScaler()
         X_tr_s = pd.DataFrame(scaler.fit_transform(X_tr), columns=features, index=X_tr.index)
         X_val_s = pd.DataFrame(scaler.transform(X_val), columns=features, index=X_val.index)
@@ -194,7 +176,6 @@ class GrandLeagueBrain:
         Xt, Xv = X_tr.iloc[:split], X_tr.iloc[split:]
         yt, yv = y_tr.iloc[:split], y_tr.iloc[split:]
         best_m = None; best_s = -1
-        
         for d in [3, 5]:
             for lr in [0.05, 0.1]:
                 m = xgb.XGBClassifier(n_estimators=80, max_depth=d, learning_rate=lr, n_jobs=1, random_state=42)
@@ -208,7 +189,6 @@ class GrandLeagueBrain:
         impute_methods = ['Baydo', 'MICE', 'KNN', 'Linear']
         strategies = []
         wf_window = 30; steps = 3
-        
         for imp in impute_methods:
             scores_xgb = []; scores_ens = []
             for i in range(steps):
@@ -216,29 +196,22 @@ class GrandLeagueBrain:
                 if i==0: test_end = len(df)
                 train_end = test_start
                 if train_end < 200: break
-                
                 df_tr = df.iloc[:train_end]; df_val = df.iloc[train_end:test_end]
                 X_tr, X_val, _ = self.lab.apply_imputation(df_tr, df_val, imp)
                 y_tr, y_val = df_tr['target'], df_val['target']
-                
                 m_xgb = self.tune_xgboost(X_tr, y_tr)
                 if m_xgb: scores_xgb.append(accuracy_score(y_val, m_xgb.predict(X_val)))
-                
                 rf = RandomForestClassifier(50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
                 et = ExtraTreesClassifier(50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
                 if m_xgb:
                     p = (rf.predict_proba(X_val)[:,1]*0.3 + et.predict_proba(X_val)[:,1]*0.3 + m_xgb.predict_proba(X_val)[:,1]*0.4)
                     scores_ens.append(accuracy_score(y_val, (p>0.5).astype(int)))
-            
             X_full, _, scaler = self.lab.apply_imputation(df, df.iloc[-5:], imp)
             final_xgb = self.tune_xgboost(X_full, df['target'])
-            
             avg_x = np.mean(scores_xgb) if scores_xgb else 0
             strategies.append({'name': f"{imp} + XGB", 'type': 'XGB', 'score': avg_x, 'model': final_xgb, 'scaler': scaler, 'imputer_name': imp})
-            
             avg_e = np.mean(scores_ens) if scores_ens else 0
             strategies.append({'name': f"{imp} + ENS", 'type': 'ENS', 'score': avg_e, 'model': 'ENS_OBJ', 'scaler': scaler, 'imputer_name': imp})
-            
         winner = max(strategies, key=lambda x: x['score'])
         return winner, strategies
 
@@ -255,7 +228,9 @@ if not pf_df.empty:
             updated_pf = pf_df.copy()
             brain = GrandLeagueBrain()
             
+            tickers, scores, vols, sizes = [], [], [], []
             prog = st.progress(0)
+            
             for i, (idx, row) in enumerate(updated_pf.iterrows()):
                 ticker = row['Ticker']
                 df = get_data(ticker)
@@ -263,19 +238,17 @@ if not pf_df.empty:
                     hist, future = prepare_features_v12(df)
                     winner, table = brain.run_league(hist)
                     
-                    # Risk Hesabı (BUG FIX: 0.50x sabitlenme sorunu çözüldü)
-                    # Artık son 10 günün ortalama volatilitesini alıyoruz (Yüzdesel)
                     current_volatility = hist['volatility_measure'].iloc[-1]
-                    
-                    # Hedef Volatilite (Kripto için %3 - %5 arası normaldir)
-                    target_vol = 0.04 
-                    
-                    if current_volatility == 0 or np.isnan(current_volatility): 
-                        risk_factor = 1.0 # Veri yoksa nötr kal
+                    target_vol = 0.04
+                    if current_volatility == 0 or np.isnan(current_volatility):
+                        risk_factor = 1.0
                     else:
-                        # Eğer volatilite %2 ise, target %4 olduğu için -> RiskFactor 2.0x (Daha çok al)
-                        # Eğer volatilite %8 ise -> RiskFactor 0.5x (Daha az al)
                         risk_factor = np.clip(target_vol / current_volatility, 0.3, 2.0)
+                    
+                    tickers.append(ticker)
+                    scores.append(winner['score']*100)
+                    vols.append(current_volatility*100)
+                    sizes.append(risk_factor)
                     
                     with st.expander(f"{ticker} | {winner['name']} (Acc: %{winner['score']*100:.1f})"):
                         c1, c2, c3 = st.columns(3)
@@ -285,7 +258,22 @@ if not pf_df.empty:
                         st.dataframe(pd.DataFrame(table)[['name', 'score']].sort_values('score', ascending=False).head(3))
                         
                 prog.progress((i+1)/len(updated_pf))
-                
+            
+            # --- PLOTLY SCATTER ---
+            viz_df = pd.DataFrame({
+                'Ticker': tickers,
+                'Model Acc (%)': scores,
+                'Volatility (%)': vols,
+                'Size Multiplier': sizes
+            })
+            fig = px.scatter(
+                viz_df, x='Volatility (%)', y='Model Acc (%)',
+                size='Size Multiplier', color='Ticker',
+                hover_data=['Ticker', 'Size Multiplier', 'Volatility (%)'],
+                title="📊 Portfolio Analysis: Risk vs Model Accuracy"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
             st.success("Analysis Complete.")
 
     with tab2: st.dataframe(pf_df)
