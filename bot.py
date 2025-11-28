@@ -8,13 +8,15 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import pytz
 
-# ML Libraries
-from hmmlearn.hmm import GaussianHMM
+# ML & Imputation
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer, KNNImputer
+from sklearn.linear_model import BayesianRidge, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.impute import KNNImputer
+from hmmlearn.hmm import GaussianHMM
 import xgboost as xgb
+from sklearn.metrics import mean_squared_error, accuracy_score
 
 warnings.filterwarnings("ignore")
 
@@ -34,252 +36,295 @@ def connect_services():
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         client = gspread.authorize(creds)
         spreadsheet = client.open_by_key(SHEET_ID)
-        
-        # 1. Ana Portföy Sayfası
-        pf_sheet = spreadsheet.sheet1
-        
-        # 2. Geçmiş Log Sayfası (Yoksa oluşturur)
-        try:
-            hist_sheet = spreadsheet.worksheet("Gecmis")
-        except:
-            hist_sheet = spreadsheet.add_worksheet(title="Gecmis", rows="1000", cols="6")
-            hist_sheet.append_row(["Tarih", "Ticker", "Islem", "Miktar", "Fiyat", "Model"])
-            logger.info("ℹ️ 'Gecmis' sayfası oluşturuldu.")
-            
-        return pf_sheet, hist_sheet
+        try: hist = spreadsheet.worksheet("Gecmis")
+        except: hist = spreadsheet.add_worksheet("Gecmis", 1000, 6)
+        return spreadsheet.sheet1, hist
     except Exception as e:
         logger.error(f"Connection Error: {e}")
         return None, None
 
 def load_portfolio(sheet):
-    if sheet is None: return pd.DataFrame()
-    try:
-        data = sheet.get_all_records()
-        if not data: return pd.DataFrame()
-        
-        df = pd.DataFrame(data)
-        
-        # Sayısal sütunları temizle
-        num_cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
-        for c in num_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
-        
-        # İstenen Sütun: Son_Islem_Tarihi (Eskiden Zamanı idi, Tarihi yaptık)
-        if 'Son_Islem_Tarihi' not in df.columns:
-            df['Son_Islem_Tarihi'] = "-"
-            
-        return df
-    except Exception as e:
-        logger.error(f"Load Error: {e}")
-        return pd.DataFrame()
+    if not sheet: return pd.DataFrame()
+    data = sheet.get_all_records()
+    if not data: return pd.DataFrame()
+    df = pd.DataFrame(data)
+    cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
+    for c in cols:
+        if c in df.columns: df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+    if 'Son_Islem_Tarihi' not in df.columns: df['Son_Islem_Tarihi'] = "-"
+    return df
 
 def save_portfolio(df, sheet):
-    if sheet is None: return
-    try:
-        df_exp = df.copy().fillna("")
-        df_exp = df_exp.astype(str)
-        sheet.clear() 
+    if sheet:
+        df_exp = df.copy().astype(str)
+        sheet.clear()
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
-        logger.info("✅ Portföy Güncellendi.")
-    except Exception as e:
-        logger.error(f"❌ Save Error: {e}")
 
 def log_transaction(sheet, ticker, action, amount, price, model):
-    if sheet is None: return
-    try:
-        now_str = datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M')
-        # Satır sırası: Tarih, Ticker, İşlem, Miktar, Fiyat, Model
-        sheet.append_row([now_str, ticker, action, float(amount), float(price), model])
-        logger.info(f"📝 Geçmişe Loglandı: {ticker} {action}")
-    except Exception as e:
-        logger.error(f"Log Error: {e}")
+    if sheet:
+        now = datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M')
+        sheet.append_row([now, ticker, action, float(amount), float(price), model])
 
-# --- LOGIC ---
+# --- AUTOML & PREPROCESSING ---
+class DataArchitect:
+    def __init__(self):
+        pass
+        
+    def find_best_imputer(self, df, features):
+        """
+        Verinin %10'unu gizleyip KNN, MICE ve Linear Interpolation'ı yarıştırır.
+        En düşük hatayı (RMSE) vereni seçer.
+        """
+        # Test için veriyi kopyala ve boz
+        test_df = df[features].copy()
+        mask = np.random.choice([True, False], size=test_df.shape, p=[0.1, 0.9])
+        ground_truth = test_df.values.copy()
+        
+        # Sadece sayısal değerler bozulur
+        test_df.values[mask] = np.nan
+        
+        results = {}
+        
+        # 1. MICE
+        try:
+            mice_imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
+            mice_filled = mice_imp.fit_transform(test_df)
+            rmse_mice = np.sqrt(mean_squared_error(ground_truth[mask], mice_filled[mask]))
+            results['MICE'] = rmse_mice
+        except: results['MICE'] = 999.0
+
+        # 2. KNN
+        try:
+            knn_imp = KNNImputer(n_neighbors=5)
+            knn_filled = knn_imp.fit_transform(test_df)
+            rmse_knn = np.sqrt(mean_squared_error(ground_truth[mask], knn_filled[mask]))
+            results['KNN'] = rmse_knn
+        except: results['KNN'] = 999.0
+        
+        # 3. Linear Interpolation
+        try:
+            lin_filled = test_df.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill').values
+            rmse_lin = np.sqrt(mean_squared_error(ground_truth[mask], lin_filled[mask]))
+            results['Linear'] = rmse_lin
+        except: results['Linear'] = 999.0
+        
+        # Kazananı Belirle
+        winner_name = min(results, key=results.get)
+        
+        # Gerçek Veriyi Kazananla Doldur
+        final_df = df.copy()
+        if winner_name == 'MICE':
+            final_df[features] = IterativeImputer(estimator=BayesianRidge(), max_iter=10).fit_transform(df[features])
+        elif winner_name == 'KNN':
+            final_df[features] = KNNImputer(n_neighbors=5).fit_transform(df[features])
+        else:
+            final_df[features] = df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+            
+        return final_df, winner_name, results[winner_name]
+
 def process_data(df):
-    if len(df) < 150: return None
+    if len(df) < 150: return None, None
     df = df.copy()
-    # Feature Engineering
-    df['kalman'] = df['close'].rolling(3).mean() 
+    
+    # Technical Indicators
+    df['kalman'] = df['close'].rolling(3).mean()
     df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
     df['ret'] = df['close'].pct_change()
     df['range'] = (df['high']-df['low'])/df['close']
     df['range_vol_delta'] = df['range'].pct_change(5)
     df['heuristic'] = (np.sign(df['close'].pct_change(5)) + np.sign(df['close'].pct_change(30)))/2.0
     
+    # Historical Stats
     df['avg_ret_5m'] = df['ret'].rolling(100).mean()*100
     df['avg_ret_3y'] = df['ret'].rolling(750).mean()*100
     avg_feats = df[['avg_ret_5m','avg_ret_3y']].fillna(0)
     df['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
     
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-    df.dropna(inplace=True)
-    return df
-
-def smart_impute(df, features):
-    if len(df) < 50: return df.fillna(0)
-    try: return pd.DataFrame(KNNImputer(n_neighbors=5).fit_transform(df[features]), columns=features, index=df.index)
-    except: return df.fillna(0)
+    
+    # AutoML: Imputation Tournament
+    features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
+    architect = DataArchitect()
+    df_clean, imp_winner, imp_score = architect.find_best_imputer(df, features)
+    
+    # Target NaN olan son satırı (gelecek) temizleme aşamasından sonra at
+    df_clean.dropna(subset=['target'], inplace=True)
+    
+    return df_clean, f"{imp_winner}"
 
 class Brain:
     def __init__(self):
         self.meta = LogisticRegression(C=1.0)
         
-    def run_tournament(self, df):
+    def optimize_xgboost(self, X_tr, y_tr, X_test):
+        """Farklı derinlik ve hızları dener, en iyi validasyon skorunu alanı seçer."""
+        best_score = -1
+        best_model = None
+        best_params = ""
+        
+        # Mini Grid Search
+        depths = [3, 5, 7]
+        lrs = [0.01, 0.1, 0.2]
+        
+        # Validation Split (Son %20 train içinden)
+        v_idx = int(len(X_tr) * 0.8)
+        X_t, X_v = X_tr.iloc[:v_idx], X_tr.iloc[v_idx:]
+        y_t, y_v = y_tr.iloc[:v_idx], y_tr.iloc[v_idx:]
+        
+        for d in depths:
+            for lr in lrs:
+                model = xgb.XGBClassifier(n_estimators=100, max_depth=d, learning_rate=lr, random_state=42)
+                model.fit(X_t, y_t)
+                score = model.score(X_v, y_v)
+                
+                if score > best_score:
+                    best_score = score
+                    best_model = model
+                    best_params = f"XGB(d={d}, lr={lr})"
+        
+        # Kazananı tüm veriyle eğit
+        best_model.fit(X_tr, y_tr)
+        return best_model, best_params
+
+    def run_tournament(self, df, imp_info):
         features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
-        df = smart_impute(df, features)
         
         test_size = 60
-        train = df.iloc[:-test_size]
-        test = df.iloc[-test_size:]
-        
+        train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
         X_tr = train[features]; y_tr = train['target']
         X_test = test[features]
         
-        # Modeller
+        # 1. Base Models (Ensemble Parçaları)
         rf = RandomForestClassifier(n_estimators=100, max_depth=5).fit(X_tr, y_tr)
         etc = ExtraTreesClassifier(n_estimators=100, max_depth=5).fit(X_tr, y_tr)
-        xgb_c = xgb.XGBClassifier(n_estimators=100, max_depth=3).fit(X_tr, y_tr)
-        xgb_solo = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1).fit(X_tr, y_tr)
         
+        # 2. Optimized XGBoost (Solo & Ensemble için)
+        opt_xgb, xgb_params = self.optimize_xgboost(X_tr, y_tr, X_test)
+        
+        # 3. HMM
         try:
             scaler = StandardScaler()
             X_hmm = scaler.fit_transform(train[['log_ret', 'range_vol_delta']].fillna(0))
             hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50).fit(X_hmm)
-            hmm_probs = hmm.predict_proba(X_hmm)
+            hmm_probs = hmm.predict_proba(X_hmm)[:,0]
+            X_hmm_t = scaler.transform(test[['log_ret', 'range_vol_delta']].fillna(0))
+            hmm_probs_t = hmm.predict_proba(X_hmm_t)[:,0]
         except: 
-            hmm_probs = np.zeros((len(train),3))
-            hmm = None
-        
+            hmm_probs = np.zeros(len(train))
+            hmm_probs_t = np.zeros(len(test))
+            
+        # 4. Meta-Learner (Ensemble)
         meta_X = pd.DataFrame({
             'RF': rf.predict_proba(X_tr)[:,1], 
             'ETC': etc.predict_proba(X_tr)[:,1], 
-            'XGB': xgb_c.predict_proba(X_tr)[:,1], 
+            'XGB': opt_xgb.predict_proba(X_tr)[:,1], 
             'Heuristic': train['heuristic'],
-            'HMM_0': hmm_probs[:,0]
+            'HMM': hmm_probs
         }, index=train.index).fillna(0)
         
         self.meta.fit(meta_X, y_tr)
         
-        try:
-            X_hmm_t = scaler.transform(test[['log_ret', 'range_vol_delta']].fillna(0))
-            hmm_probs_t = hmm.predict_proba(X_hmm_t) if hmm else np.zeros((len(test),3))
-        except: hmm_probs_t = np.zeros((len(test),3))
-        
         meta_X_test = pd.DataFrame({
             'RF': rf.predict_proba(X_test)[:,1], 
             'ETC': etc.predict_proba(X_test)[:,1], 
-            'XGB': xgb_c.predict_proba(X_test)[:,1], 
+            'XGB': opt_xgb.predict_proba(X_test)[:,1], 
             'Heuristic': test['heuristic'],
-            'HMM_0': hmm_probs_t[:,0]
+            'HMM': hmm_probs_t
         }, index=test.index).fillna(0)
         
         p_ens = self.meta.predict_proba(meta_X_test)[:,1]
-        p_solo = xgb_solo.predict_proba(X_test)[:,1]
+        p_solo = opt_xgb.predict_proba(X_test)[:,1]
         
+        # Simülasyon
         sim_ens = 100.0; sim_solo = 100.0
         rets = test['close'].pct_change().fillna(0).values
         for i in range(len(test)):
             if p_ens[i] > 0.55: sim_ens *= (1+rets[i])
             if p_solo[i] > 0.55: sim_solo *= (1+rets[i])
             
-        if sim_solo > sim_ens: return p_solo[-1], "Solo XGB"
-        return p_ens[-1], "Ensemble"
+        winner_model = "Ensemble" if sim_ens >= sim_solo else "Solo Optimized XGB"
+        prob = p_ens[-1] if winner_model == "Ensemble" else p_solo[-1]
+        
+        return prob, winner_model, imp_info, xgb_params
 
 # --- MAIN ---
 if __name__ == "__main__":
-    logger.info("Bot Started.")
+    logger.info("Bot Started V8 (AutoML).")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     
-    if pf.empty: 
-        logger.error("Portfolio Empty or Connection Failed.")
-        exit()
-    
+    if pf.empty: exit()
     updated = pf.copy()
     
-    # 1. Havuz Hesabı ve Sıfırlama (Kritik Düzeltme)
+    # Nakit Yönetimi
     cash = updated['Nakit_Bakiye_USD'].sum()
     updated['Nakit_Bakiye_USD'] = 0.0
     
     buys = []
     brain = Brain()
-    
-    # Tarih formatı
     now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
     
-    # 2. ANALİZ & SATIŞ
     for i, (idx, row) in enumerate(updated.iterrows()):
         ticker = row['Ticker']
         try:
             df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
-            if df.empty: continue
+            if df is None or df.empty: continue
             
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
             
-            df = process_data(df)
-            prob, winner = brain.run_tournament(df)
-            
-            decision = "HOLD"
-            if prob > 0.55: decision = "BUY"
-            elif prob < 0.45: decision = "SELL"
-            
-            logger.info(f"{ticker}: {decision} ({winner}) P:{prob:.2f}")
-            
-            # --- SATIŞ ---
-            if row['Durum'] == 'COIN' and decision == "SELL":
-                val = float(row['Miktar']) * df['close'].iloc[-1]
-                cash += val
+            # AutoML Pipeline
+            df_processed, imp_info = process_data(df)
+            if df_processed is not None:
+                prob, winner, imp_method, xgb_p = brain.run_tournament(df_processed, imp_info)
                 
-                updated.at[idx, 'Durum'] = 'CASH'
-                updated.at[idx, 'Miktar'] = 0.0
-                updated.at[idx, 'Son_Islem_Log'] = f"SAT ({winner})"
-                updated.at[idx, 'Son_Islem_Tarihi'] = now_str
+                decision = "HOLD"
+                if prob > 0.55: decision = "BUY"
+                elif prob < 0.45: decision = "SELL"
                 
-                # Loglama
-                log_transaction(hist_sheet, ticker, "SAT", row['Miktar'], df['close'].iloc[-1], winner)
+                log_msg = f"{winner} | {imp_method} | {xgb_p}"
+                logger.info(f"{ticker}: {decision} ({log_msg})")
                 
-            # --- ALIM LİSTESİ ---
-            elif row['Durum'] == 'CASH' and decision == "BUY":
-                buys.append({'idx':idx, 'ticker':ticker, 'price':df['close'].iloc[-1], 'weight':prob, 'winner':winner})
-                
+                # SATIŞ
+                if row['Durum'] == 'COIN' and decision == "SELL":
+                    val = float(row['Miktar']) * df['close'].iloc[-1]
+                    cash += val
+                    updated.at[idx, 'Durum'] = 'CASH'
+                    updated.at[idx, 'Miktar'] = 0.0
+                    updated.at[idx, 'Son_Islem_Log'] = f"SAT ({log_msg})"
+                    updated.at[idx, 'Son_Islem_Tarihi'] = now_str
+                    log_transaction(hist_sheet, ticker, "SAT", row['Miktar'], df['close'].iloc[-1], log_msg)
+                    
+                # ALIM ADAYI
+                elif row['Durum'] == 'CASH' and decision == "BUY":
+                    buys.append({'idx':idx, 'ticker':ticker, 'p':df['close'].iloc[-1], 'w':prob, 'model':log_msg})
+                    
         except Exception as e: logger.error(f"Err {ticker}: {e}")
             
-    # 3. ALIM İŞLEMİ
+    # ALIMLAR
     if buys and cash > 2.0:
-        total_w = sum([b['weight'] for b in buys])
+        total_w = sum([b['w'] for b in buys])
         for b in buys:
-            share = (b['weight'] / total_w) * cash
-            amt = share / b['price']
-            
+            share = (b['w'] / total_w) * cash
+            amt = share / b['p']
             updated.at[b['idx'], 'Durum'] = 'COIN'
             updated.at[b['idx'], 'Miktar'] = amt
             updated.at[b['idx'], 'Nakit_Bakiye_USD'] = 0.0
-            updated.at[b['idx'], 'Son_Islem_Fiyati'] = b['price']
-            updated.at[b['idx'], 'Son_Islem_Log'] = f"AL ({b['winner']})"
+            updated.at[b['idx'], 'Son_Islem_Fiyati'] = b['p']
+            updated.at[b['idx'], 'Son_Islem_Log'] = f"AL ({b['model']})"
             updated.at[b['idx'], 'Son_Islem_Tarihi'] = now_str
-            
-            # Loglama
-            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['price'], b['winner'])
+            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['model'])
 
-    # 4. KALAN NAKİT YÖNETİMİ
     elif cash > 0:
-        fidx = updated.index[0]
-        current_cash_in_row = float(updated.at[fidx, 'Nakit_Bakiye_USD'])
-        updated.at[fidx, 'Nakit_Bakiye_USD'] = current_cash_in_row + cash
+        updated.at[updated.index[0], 'Nakit_Bakiye_USD'] += cash
             
-    # 5. DEĞERLEME
+    # Değerleme
     for idx, row in updated.iterrows():
         if row['Durum'] == 'COIN':
             try:
-                td = yf.download(row['Ticker'], period="1d", interval="1m", progress=False)
-                if not td.empty:
-                    p = td['Close'].iloc[-1]
-                    if isinstance(p, pd.Series): p = p.iloc[0]
-                    updated.at[idx, 'Kaydedilen_Deger_USD'] = float(row['Miktar']) * float(p)
+                p = yf.download(row['Ticker'], period="1d", progress=False)['Close'].iloc[-1]
+                updated.at[idx, 'Kaydedilen_Deger_USD'] = float(row['Miktar']) * float(p)
             except: pass
         else: updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
         
-    # KAYDET
     save_portfolio(updated, pf_sheet)
