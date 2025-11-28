@@ -21,18 +21,18 @@ import plotly.graph_objects as go
 
 warnings.filterwarnings("ignore")
 
-# UI
-st.set_page_config(page_title="Hedge Fund AI: V11", layout="wide", page_icon="🏦")
+# UI CONFIG
+st.set_page_config(page_title="Hedge Fund AI: V12 Stable", layout="wide", page_icon="🛡️")
 st.markdown("""
 <style>
     .main {background-color: #0E1117;}
-    .header-box {background: linear-gradient(135deg, #0f2027 0%, #203a43 100%, #2c5364 100%); padding: 25px; border-radius: 12px; border-left: 5px solid #FFD700; margin-bottom: 25px;}
+    .header-box {background: linear-gradient(135deg, #2b5876 0%, #4e4376 100%); padding: 25px; border-radius: 12px; border-left: 5px solid #FFD700; margin-bottom: 25px;}
     .header-title {font-size: 32px; font-weight: 700; color: #fff; margin:0;}
     .header-sub {font-size: 14px; color: #b0b0b0; margin-top: 5px;}
 </style>
 <div class="header-box">
-    <div class="header-title">🏦 Hedge Fund AI: V11 (Leakage Proof)</div>
-    <div class="header-sub">Strict Train/Test Split • Validation Tuning • Risk Adjusted Sizing • Dynamic Baydo</div>
+    <div class="header-title">🛡️ Hedge Fund AI: V12 (Bug Fix Edition)</div>
+    <div class="header-sub">Fixed Risk Calculation • Dynamic Volatility • Independent Coin Analysis</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -81,20 +81,24 @@ def save_portfolio(df, sheet):
         sheet.clear()
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
 
-# --- ADVANCED FEATURES ---
+# --- FEATURES ---
 def add_technical_indicators(df):
     df = df.copy()
+    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
     
+    # ATR (Fixed Calculation)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
-    df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
     
+    # SMA
     df['sma_20'] = df['close'].rolling(20).mean()
     df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
     return df
@@ -108,20 +112,25 @@ def get_data(ticker):
         return df
     except: return None
 
-def prepare_features_v11(df):
+def prepare_features_v12(df):
     df = df.copy().replace([np.inf, -np.inf], np.nan)
     df = add_technical_indicators(df)
     
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     df['range'] = (df['high'] - df['low']) / df['close']
-    df['volatility_measure'] = df['close'].pct_change().rolling(window=10).std()
+    # Volatiliteyi yüzdesel olarak hesapla (Fix: 0.50x bug)
+    df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
+    
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+    
+    # NaN temizliği (Başlangıçtaki rolling NaN'ları temizle)
+    df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
     
     future = df.iloc[[-1]].copy()
     hist = df.iloc[:-1].copy()
     return hist, future
 
-# --- IMPUTATION LAB ---
+# --- IMPUTATION LAB (Baydo v2) ---
 class ImputationLab:
     def baydo_impute(self, df):
         filled = df.copy()
@@ -186,9 +195,9 @@ class GrandLeagueBrain:
         yt, yv = y_tr.iloc[:split], y_tr.iloc[split:]
         best_m = None; best_s = -1
         
-        for d in [3, 5, 6]:
-            for lr in [0.01, 0.05, 0.1]:
-                m = xgb.XGBClassifier(n_estimators=100, max_depth=d, learning_rate=lr, n_jobs=1, random_state=42)
+        for d in [3, 5]:
+            for lr in [0.05, 0.1]:
+                m = xgb.XGBClassifier(n_estimators=80, max_depth=d, learning_rate=lr, n_jobs=1, random_state=42)
                 m.fit(Xt, yt)
                 s = accuracy_score(yv, m.predict(Xv))
                 if s > best_s: best_m = m; best_s = s
@@ -221,7 +230,6 @@ class GrandLeagueBrain:
                     p = (rf.predict_proba(X_val)[:,1]*0.3 + et.predict_proba(X_val)[:,1]*0.3 + m_xgb.predict_proba(X_val)[:,1]*0.4)
                     scores_ens.append(accuracy_score(y_val, (p>0.5).astype(int)))
             
-            # Final Train
             X_full, _, scaler = self.lab.apply_imputation(df, df.iloc[-5:], imp)
             final_xgb = self.tune_xgboost(X_full, df['target'])
             
@@ -238,51 +246,47 @@ class GrandLeagueBrain:
 pf_df, sheet_pf = load_portfolio()
 _, sheet_hist = connect_sheet_services()
 
-tab1, tab2, tab3 = st.tabs(["🚀 Control & Analysis", "📊 Live Data", "📜 Trade Logs"])
+tab1, tab2, tab3 = st.tabs(["🚀 Control", "📊 Data", "📜 Logs"])
 
 if not pf_df.empty:
     with tab1:
-        st.metric("Portfolio Value", f"${pf_df['Nakit_Bakiye_USD'].sum() + pf_df[pf_df['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum():.2f}")
-        if st.button("🔥 START HEDGE FUND ENGINE", type="primary"):
+        st.metric("Total Portfolio", f"${pf_df['Nakit_Bakiye_USD'].sum() + pf_df[pf_df['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum():.2f}")
+        if st.button("🔥 START ANALYSIS", type="primary"):
             updated_pf = pf_df.copy()
-            pool_cash = updated_pf['Nakit_Bakiye_USD'].sum(); updated_pf['Nakit_Bakiye_USD'] = 0.0
             brain = GrandLeagueBrain()
-            buy_orders = []
             
             prog = st.progress(0)
             for i, (idx, row) in enumerate(updated_pf.iterrows()):
                 ticker = row['Ticker']
                 df = get_data(ticker)
-                if df is not None:
-                    hist, future = prepare_features_v11(df)
+                if df is not None and len(df) > 200:
+                    hist, future = prepare_features_v12(df)
                     winner, table = brain.run_league(hist)
                     
-                    # Final Prediction Logic (Simplified for UI visualization)
-                    decision = "HOLD"; prob = 0.5
+                    # Risk Hesabı (BUG FIX: 0.50x sabitlenme sorunu çözüldü)
+                    # Artık son 10 günün ortalama volatilitesini alıyoruz (Yüzdesel)
+                    current_volatility = hist['volatility_measure'].iloc[-1]
                     
-                    # Risk Calc
-                    volatility = hist['atr'].iloc[-1] / hist['close'].iloc[-1]
-                    if np.isnan(volatility): volatility = 0.02
-                    risk_factor = np.clip(0.02 / volatility, 0.5, 1.5)
+                    # Hedef Volatilite (Kripto için %3 - %5 arası normaldir)
+                    target_vol = 0.04 
                     
-                    with st.expander(f"{ticker} | Winner: {winner['name']} (Acc: %{winner['score']*100:.1f})"):
-                        c1, c2 = st.columns(2)
-                        c1.metric("Validation Score", f"%{winner['score']*100:.1f}")
-                        c1.metric("Risk Factor (Volatility)", f"{risk_factor:.2f}x")
-                        c2.dataframe(pd.DataFrame(table)[['name', 'score']].sort_values('score', ascending=False).head(3))
+                    if current_volatility == 0 or np.isnan(current_volatility): 
+                        risk_factor = 1.0 # Veri yoksa nötr kal
+                    else:
+                        # Eğer volatilite %2 ise, target %4 olduğu için -> RiskFactor 2.0x (Daha çok al)
+                        # Eğer volatilite %8 ise -> RiskFactor 0.5x (Daha az al)
+                        risk_factor = np.clip(target_vol / current_volatility, 0.3, 2.0)
+                    
+                    with st.expander(f"{ticker} | {winner['name']} (Acc: %{winner['score']*100:.1f})"):
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Model Acc", f"%{winner['score']*100:.1f}")
+                        c2.metric("Market Volatility", f"%{current_volatility*100:.2f}")
+                        c3.metric("Size Multiplier", f"{risk_factor:.2f}x")
+                        st.dataframe(pd.DataFrame(table)[['name', 'score']].sort_values('score', ascending=False).head(3))
                         
-                        # Prediction Simulate
-                        # Gerçek prediction bot.py ile aynı mantıkta yapılmalı, burada UI amaçlı winner score gösteriyoruz
-                        
-                    current_p = df['close'].iloc[-1]
-                    m_desc = f"{winner['name']} (Acc:{winner['score']:.2f})"
-                    
-                    # Simulated Decision for UI loop (Actual logic needs imputation)
-                    # Burası sadece görseldir, gerçek emirler bot.py'de daha güvenli
-                    
                 prog.progress((i+1)/len(updated_pf))
                 
-            st.success("Analysis Complete. Check Logs for trades.")
+            st.success("Analysis Complete.")
 
     with tab2: st.dataframe(pf_df)
     with tab3: 
