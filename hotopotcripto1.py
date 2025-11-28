@@ -23,7 +23,7 @@ import plotly.graph_objects as go
 warnings.filterwarnings("ignore")
 
 # UI CONFIG
-st.set_page_config(page_title="Hedge Fund AI: V8 AutoML", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Hedge Fund AI: V8.2 Stable", layout="wide", page_icon="🧠")
 st.markdown("""
 <style>
     .main {background-color: #0E1117;}
@@ -32,8 +32,8 @@ st.markdown("""
     .header-sub {font-size: 14px; color: #b0b0b0; margin-top: 5px;}
 </style>
 <div class="header-box">
-    <div class="header-title">🧠 Hedge Fund AI: V8.1 (AutoML & Tournament)</div>
-    <div class="header-sub">Auto-Imputation Selection • XGBoost Auto-Tuning • Transparency Report • Crash Protection</div>
+    <div class="header-title">🧠 Hedge Fund AI: V8.2 (Crash Proof)</div>
+    <div class="header-sub">Auto-Imputation Selection • XGBoost Auto-Tuning • Enhanced Error Handling</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -82,7 +82,7 @@ def save_portfolio(df, sheet):
         sheet.clear()
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
 
-# --- AUTOML LOGIC ---
+# --- AUTOML LOGIC (GÜÇLENDİRİLMİŞ) ---
 def get_data(ticker):
     try:
         df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
@@ -95,78 +95,92 @@ def get_data(ticker):
 class DataArchitect:
     def find_best_imputer(self, df, features):
         """
-        Geliştirilmiş ve Hata Korumalı Imputer Seçicisi.
+        Zırhlı Imputer Seçicisi:
+        Eğer MICE veya KNN, sütun sayısını değiştirirse (Hata sebebi), 
+        otomatik olarak basit doldurma (Simple Fill) yöntemine geçer.
         """
-        # Sonsuz değerleri temizle (MICE hatasının ana kaynağı)
+        # 1. Ön Temizlik: Sonsuzları yok et
         df = df.replace([np.inf, -np.inf], np.nan)
         
-        # Test seti oluştur
-        test_df = df[features].copy()
-        mask = np.random.choice([True, False], size=test_df.shape, p=[0.1, 0.9])
-        ground_truth = test_df.values.copy()
+        # Sadece sayısal sütunları hedefle
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         
-        # Simülasyon Verisi (Bozuk)
-        sim_df = df.copy()
-        for col in features:
-            sim_df.loc[mask[:, features.index(col)], col] = np.nan
-            
+        # Test için kopya
+        test_df = df[features].copy()
+        
+        # Mask oluştur (Verinin %10'unu gizle)
+        try:
+            mask = np.random.choice([True, False], size=test_df.shape, p=[0.1, 0.9])
+            ground_truth = test_df.values.copy()
+            sim_df = test_df.copy()
+            sim_df.values[mask] = np.nan
+        except:
+            # Mask oluşturulamazsa (veri çok küçükse) direkt Linear dön
+            return df.interpolate(method='linear').fillna(method='bfill'), "Linear (Fallback)", {}
+
         results = {}
         
-        # 1. MICE (Hata korumalı)
+        # --- YARIŞMA BÖLÜMÜ ---
+        # 1. MICE
         try:
-            numeric_cols = sim_df.select_dtypes(include=[np.number]).columns
             imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
-            # fit_transform sonucu array döner
-            filled_matrix = imp.fit_transform(sim_df[numeric_cols])
-            
-            # Boyut kontrolü: Eğer MICE sütun attıysa (shape mismatch), hatayı yakala
-            if filled_matrix.shape[1] == len(numeric_cols):
-                temp_df = pd.DataFrame(filled_matrix, columns=numeric_cols, index=sim_df.index)
-                results['MICE'] = np.sqrt(mean_squared_error(ground_truth[mask], temp_df[features].values[mask]))
-            else:
-                results['MICE'] = 999.0
+            filled = imp.fit_transform(sim_df)
+            if filled.shape == sim_df.shape: # Boyut kontrolü
+                results['MICE'] = np.sqrt(mean_squared_error(ground_truth[mask], filled[mask]))
+            else: results['MICE'] = 999.0
         except: results['MICE'] = 999.0
 
         # 2. KNN
         try:
-            knn_imp = KNNImputer(n_neighbors=5)
-            numeric_cols = sim_df.select_dtypes(include=[np.number]).columns
-            filled_matrix = knn_imp.fit_transform(sim_df[numeric_cols])
-            temp_df = pd.DataFrame(filled_matrix, columns=numeric_cols, index=sim_df.index)
-            results['KNN'] = np.sqrt(mean_squared_error(ground_truth[mask], temp_df[features].values[mask]))
+            imp = KNNImputer(n_neighbors=5)
+            filled = imp.fit_transform(sim_df)
+            if filled.shape == sim_df.shape:
+                results['KNN'] = np.sqrt(mean_squared_error(ground_truth[mask], filled[mask]))
+            else: results['KNN'] = 999.0
         except: results['KNN'] = 999.0
         
         # 3. Linear
         try:
-            df_lin = sim_df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
-            results['Linear'] = np.sqrt(mean_squared_error(ground_truth[mask], df_lin.values[mask]))
+            filled = sim_df.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill').values
+            results['Linear'] = np.sqrt(mean_squared_error(ground_truth[mask], filled[mask]))
         except: results['Linear'] = 999.0
         
         # Kazananı Belirle
         winner = min(results, key=results.get)
         final_df = df.copy()
         
-        # Gerçek Veriyi Kazananla Doldur (HATA DÜZELTME BÖLÜMÜ)
-        numeric_cols = final_df.select_dtypes(include=[np.number]).columns
-        
+        # --- UYGULAMA BÖLÜMÜ (HATA KORUMALI) ---
+        # Burası "Columns must be same length as key" hatasını önleyen yerdir.
         try:
             if winner == 'MICE':
-                filled_matrix = IterativeImputer(estimator=BayesianRidge(), max_iter=10).fit_transform(final_df[numeric_cols])
-                # Boyut değiştiyse (sütun düştüyse) KNN'e fallback yap
-                if filled_matrix.shape[1] == len(numeric_cols):
-                    final_df[numeric_cols] = filled_matrix
+                imputer = IterativeImputer(estimator=BayesianRidge(), max_iter=10)
+                filled_data = imputer.fit_transform(final_df[numeric_cols])
+                
+                # KRİTİK KONTROL: Sütun sayısı tutuyor mu?
+                if filled_data.shape[1] == len(numeric_cols):
+                    final_df[numeric_cols] = filled_data
                 else:
-                    winner = "KNN (Fallback)" # MICE başarısız oldu, KNN'e geçildi
-                    final_df[numeric_cols] = KNNImputer(n_neighbors=5).fit_transform(final_df[numeric_cols])
+                    raise ValueError("MICE sütun düşürdü.")
                     
             elif winner == 'KNN':
-                final_df[numeric_cols] = KNNImputer(n_neighbors=5).fit_transform(final_df[numeric_cols])
+                imputer = KNNImputer(n_neighbors=5)
+                filled_data = imputer.fit_transform(final_df[numeric_cols])
+                
+                if filled_data.shape[1] == len(numeric_cols):
+                    final_df[numeric_cols] = filled_data
+                else:
+                    raise ValueError("KNN sütun düşürdü.")
+                    
             else:
-                final_df[features] = final_df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+                raise ValueError("Linear seçildi veya fallback lazım.")
+
         except Exception as e:
-            # Her şey ters giderse en güvenlisi KNN
-            winner = "KNN (Emergency)"
-            final_df[numeric_cols] = KNNImputer(n_neighbors=5).fit_transform(final_df[numeric_cols])
+            # Herhangi bir hata olursa (Boyut uyuşmazlığı dahil) GÜVENLİ LİMANA SIKIN
+            winner = f"{winner} (Failed -> Linear)"
+            # Sadece hedef featureları basit yöntemle doldur
+            final_df[features] = final_df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+            # Kalan NaN varsa 0 bas (En son çare)
+            final_df = final_df.fillna(0)
             
         return final_df, winner, results
 
@@ -174,10 +188,12 @@ def process_data_automl(df):
     if df is None or len(df)<150: return None, None, None
     df = df.copy()
     
-    # NaN ve Inf temizliği (En baştan)
-    df.fillna(method='ffill', inplace=True)
+    # 1. Temel Temizlik (Infinite değerleri NaN yap)
     df = df.replace([np.inf, -np.inf], np.nan)
+    # Ön dolum (Feature üretimi için gerekli, sonra Architect temizleyecek)
+    df.fillna(method='ffill', inplace=True)
     
+    # 2. Feature Engineering
     df['kalman'] = df['close'].rolling(3).mean()
     df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
     df['ret'] = df['close'].pct_change()
@@ -188,23 +204,22 @@ def process_data_automl(df):
     df['avg_ret_5m'] = df['ret'].rolling(100).mean()*100
     df['avg_ret_3y'] = df['ret'].rolling(750).mean()*100
     
-    # Scale işlemi
     try:
         avg_feats = df[['avg_ret_5m','avg_ret_3y']].fillna(0)
         df['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
-    except:
-        df['historical_avg_score'] = 0.0
-        
+    except: df['historical_avg_score'] = 0
+    
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     
-    # Feature listesi
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
     
-    # Architect çağır
+    # 3. AutoML (Hata korumalı)
     architect = DataArchitect()
     df_clean, winner_imp, imp_scores = architect.find_best_imputer(df, features)
     
+    # Hedef (Yarın) belli olmayan son satırı at
     df_clean.dropna(subset=['target'], inplace=True)
+    
     return df_clean, winner_imp, imp_scores
 
 class Brain:
@@ -287,7 +302,7 @@ if not pf_df.empty:
                 ticker = row['Ticker']
                 df = get_data(ticker)
                 if df is not None:
-                    # AutoML İşlemi
+                    # AutoML İşlemi (Hata Korumalı)
                     df_clean, imp_winner, imp_scores = process_data_automl(df)
                     
                     if df_clean is not None:
@@ -299,7 +314,7 @@ if not pf_df.empty:
                         with st.expander(f"{ticker} | {decision} | {res['winner']} (ROI: %{res['roi']:.1f})"):
                             c1, c2, c3 = st.columns(3)
                             c1.markdown(f"**Temizlik:** `{imp_winner}`")
-                            c1.caption(f"Hata (RMSE): {imp_scores.get(imp_winner, 0):.5f}")
+                            c1.caption(f"Hata: {imp_scores.get(imp_winner.split(' ')[0], 0):.5f}")
                             c2.markdown(f"**XGB Tuning:** `{res['xgb_params']}`")
                             c3.markdown("**Ensemble:** RF+ETC+HMM+XGB")
                             st.line_chart(pd.DataFrame({'Ensemble': res['eq_ens'], 'Solo': res['eq_solo']}))
@@ -334,6 +349,7 @@ if not pf_df.empty:
         if st.button("🧪 Veriyi Test Et"):
             df = get_data(test_ticker)
             if df is not None:
+                # Test Modülü
                 df['kalman'] = df['close'].rolling(3).mean()
                 df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
                 df['ret'] = df['close'].pct_change()
@@ -342,8 +358,11 @@ if not pf_df.empty:
                 df['heuristic'] = (np.sign(df['close'].pct_change(5)) + np.sign(df['close'].pct_change(30)))/2.0
                 df['avg_ret_5m'] = df['ret'].rolling(100).mean()*100
                 df['avg_ret_3y'] = df['ret'].rolling(750).mean()*100
-                avg_feats = df[['avg_ret_5m','avg_ret_3y']].fillna(0)
-                df['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
+                
+                try:
+                    avg_feats = df[['avg_ret_5m','avg_ret_3y']].fillna(0)
+                    df['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
+                except: df['historical_avg_score'] = 0
                 
                 features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
                 architect = DataArchitect()
