@@ -28,23 +28,34 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
 # --- CONNECT ---
-def connect_sheet():
+def connect_services():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     try:
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         client = gspread.authorize(creds)
-        return client.open_by_key(SHEET_ID).sheet1
+        spreadsheet = client.open_by_key(SHEET_ID)
+        
+        # 1. Ana Portföy Sayfası
+        pf_sheet = spreadsheet.sheet1
+        
+        # 2. Geçmiş Log Sayfası (Yoksa oluşturur)
+        try:
+            hist_sheet = spreadsheet.worksheet("Gecmis")
+        except:
+            hist_sheet = spreadsheet.add_worksheet(title="Gecmis", rows="1000", cols="6")
+            hist_sheet.append_row(["Tarih", "Ticker", "Islem", "Miktar", "Fiyat", "Model"])
+            logger.info("ℹ️ 'Gecmis' sayfası oluşturuldu.")
+            
+        return pf_sheet, hist_sheet
     except Exception as e:
-        logger.error(f"Sheet Error: {e}")
-        return None
+        logger.error(f"Connection Error: {e}")
+        return None, None
 
-def load_portfolio():
-    sheet = connect_sheet()
-    if sheet is None: return pd.DataFrame(), None
+def load_portfolio(sheet):
+    if sheet is None: return pd.DataFrame()
     try:
-        # Tüm verileri çek
         data = sheet.get_all_records()
-        if not data: return pd.DataFrame(), sheet
+        if not data: return pd.DataFrame()
         
         df = pd.DataFrame(data)
         
@@ -54,30 +65,35 @@ def load_portfolio():
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
         
-        # Eğer 'Son_Islem_Zamani' sütunu yoksa oluştur
-        if 'Son_Islem_Zamani' not in df.columns:
-            df['Son_Islem_Zamani'] = "-"
+        # İstenen Sütun: Son_Islem_Tarihi (Eskiden Zamanı idi, Tarihi yaptık)
+        if 'Son_Islem_Tarihi' not in df.columns:
+            df['Son_Islem_Tarihi'] = "-"
             
-        return df, sheet
+        return df
     except Exception as e:
         logger.error(f"Load Error: {e}")
-        return pd.DataFrame(), None
+        return pd.DataFrame()
 
 def save_portfolio(df, sheet):
     if sheet is None: return
     try:
-        # 1. NaN değerleri temizle (Google Sheets sevmez)
         df_exp = df.copy().fillna("")
-        
-        # 2. Her şeyi string'e çevir (Format hatasını önler)
         df_exp = df_exp.astype(str)
-        
-        # 3. Sheet'i TEMİZLE ve YENİDEN YAZ (En garanti yöntem)
         sheet.clear() 
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
-        logger.info("✅ Google Sheet TAMAMEN GÜNCELLENDİ.")
+        logger.info("✅ Portföy Güncellendi.")
     except Exception as e:
         logger.error(f"❌ Save Error: {e}")
+
+def log_transaction(sheet, ticker, action, amount, price, model):
+    if sheet is None: return
+    try:
+        now_str = datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M')
+        # Satır sırası: Tarih, Ticker, İşlem, Miktar, Fiyat, Model
+        sheet.append_row([now_str, ticker, action, float(amount), float(price), model])
+        logger.info(f"📝 Geçmişe Loglandı: {ticker} {action}")
+    except Exception as e:
+        logger.error(f"Log Error: {e}")
 
 # --- LOGIC ---
 def process_data(df):
@@ -173,26 +189,26 @@ class Brain:
 # --- MAIN ---
 if __name__ == "__main__":
     logger.info("Bot Started.")
-    pf, sheet = load_portfolio()
+    pf_sheet, hist_sheet = connect_services()
+    pf = load_portfolio(pf_sheet)
+    
     if pf.empty: 
-        logger.error("Portfolio Empty.")
+        logger.error("Portfolio Empty or Connection Failed.")
         exit()
     
     updated = pf.copy()
     
-    # --- KRITİK DÜZELTME BAŞLANGICI ---
-    # Mevcut nakiti değişkene al ve tablodaki tüm nakitleri SIFIRLA.
+    # 1. Havuz Hesabı ve Sıfırlama (Kritik Düzeltme)
     cash = updated['Nakit_Bakiye_USD'].sum()
     updated['Nakit_Bakiye_USD'] = 0.0
-    # --- KRİTİK DÜZELTME BİTİŞİ ---
     
     buys = []
     brain = Brain()
     
-    # Tarih formatı (Kesin string olarak)
-    now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%d-%m %H:%M'))
+    # Tarih formatı
+    now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
     
-    # 1. ANALİZ
+    # 2. ANALİZ & SATIŞ
     for i, (idx, row) in enumerate(updated.iterrows()):
         ticker = row['Ticker']
         try:
@@ -211,43 +227,49 @@ if __name__ == "__main__":
             
             logger.info(f"{ticker}: {decision} ({winner}) P:{prob:.2f}")
             
-            # SATIŞ
+            # --- SATIŞ ---
             if row['Durum'] == 'COIN' and decision == "SELL":
                 val = float(row['Miktar']) * df['close'].iloc[-1]
-                cash += val # Nakit havuza eklenir
+                cash += val
+                
                 updated.at[idx, 'Durum'] = 'CASH'
                 updated.at[idx, 'Miktar'] = 0.0
-                # Nakit bakiye satırına yazılmaz, havuzda birikir.
                 updated.at[idx, 'Son_Islem_Log'] = f"SAT ({winner})"
-                updated.at[idx, 'Son_Islem_Zamani'] = now_str
+                updated.at[idx, 'Son_Islem_Tarihi'] = now_str
                 
-            # ALIM LİSTESİ
+                # Loglama
+                log_transaction(hist_sheet, ticker, "SAT", row['Miktar'], df['close'].iloc[-1], winner)
+                
+            # --- ALIM LİSTESİ ---
             elif row['Durum'] == 'CASH' and decision == "BUY":
-                buys.append({'idx':idx, 'price':df['close'].iloc[-1], 'weight':prob, 'winner':winner})
+                buys.append({'idx':idx, 'ticker':ticker, 'price':df['close'].iloc[-1], 'weight':prob, 'winner':winner})
                 
         except Exception as e: logger.error(f"Err {ticker}: {e}")
             
-    # 2. ALIM İŞLEMİ
+    # 3. ALIM İŞLEMİ
     if buys and cash > 2.0:
         total_w = sum([b['weight'] for b in buys])
         for b in buys:
             share = (b['weight'] / total_w) * cash
             amt = share / b['price']
+            
             updated.at[b['idx'], 'Durum'] = 'COIN'
             updated.at[b['idx'], 'Miktar'] = amt
             updated.at[b['idx'], 'Nakit_Bakiye_USD'] = 0.0
             updated.at[b['idx'], 'Son_Islem_Fiyati'] = b['price']
             updated.at[b['idx'], 'Son_Islem_Log'] = f"AL ({b['winner']})"
-            updated.at[b['idx'], 'Son_Islem_Zamani'] = now_str
+            updated.at[b['idx'], 'Son_Islem_Tarihi'] = now_str
+            
+            # Loglama
+            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['price'], b['winner'])
 
-    # 3. KALAN NAKİT YÖNETİMİ
-    # Eğer alım yapılmadıysa veya nakit arttıysa, kalan parayı ilk satıra yaz.
+    # 4. KALAN NAKİT YÖNETİMİ
     elif cash > 0:
         fidx = updated.index[0]
         current_cash_in_row = float(updated.at[fidx, 'Nakit_Bakiye_USD'])
         updated.at[fidx, 'Nakit_Bakiye_USD'] = current_cash_in_row + cash
             
-    # 4. DEĞERLEME
+    # 5. DEĞERLEME
     for idx, row in updated.iterrows():
         if row['Durum'] == 'COIN':
             try:
@@ -259,5 +281,5 @@ if __name__ == "__main__":
             except: pass
         else: updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
         
-    # SON ADIM: KAYDET
-    save_portfolio(updated, sheet)
+    # KAYDET
+    save_portfolio(updated, pf_sheet)
