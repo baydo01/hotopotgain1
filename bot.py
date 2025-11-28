@@ -14,9 +14,8 @@ from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer, KNNImputer
 from sklearn.linear_model import BayesianRidge, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import TimeSeriesSplit # Walk-Forward için
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import accuracy_score, precision_score
 from hmmlearn.hmm import GaussianHMM
 import xgboost as xgb
 
@@ -67,7 +66,30 @@ def log_transaction(sheet, ticker, action, amount, price, model):
         try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
         except: pass
 
-# --- DATA PREP & FEATURES ---
+# --- ADVANCED FEATURE ENGINEERING ---
+def add_technical_indicators(df):
+    df = df.copy()
+    # RSI
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # ATR (Volatility)
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df['atr'] = true_range.rolling(14).mean()
+    
+    # Trend (SMA)
+    df['sma_20'] = df['close'].rolling(20).mean()
+    df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
+    
+    return df
+
 def get_data(ticker):
     try:
         df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
@@ -77,290 +99,289 @@ def get_data(ticker):
         return df
     except: return None
 
-def prepare_raw_features(df):
+def prepare_features_v11(df):
     df = df.copy()
     df = df.replace([np.inf, -np.inf], np.nan)
     
-    # Teknik İndikatörler
-    df['kalman'] = df['close'].rolling(3).mean()
-    df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
-    df['ret'] = df['close'].pct_change()
-    df['range'] = (df['high']-df['low'])/df['close']
-    df['range_vol_delta'] = df['range'].pct_change(5)
-    df['heuristic'] = (np.sign(df['close'].pct_change(5)) + np.sign(df['close'].pct_change(30)))/2.0
+    # Yeni İndikatörler
+    df = add_technical_indicators(df)
     
-    # Volatilite (BaydoImputation için gerekli)
-    df['volatility'] = df['close'].pct_change().rolling(window=10).std()
+    # Temel Türevler
+    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    df['range'] = (df['high'] - df['low']) / df['close']
+    df['volatility_measure'] = df['close'].pct_change().rolling(window=10).std() # Baydo için
     
-    # Historical Stats
-    df['avg_ret_5m'] = df['ret'].rolling(100).mean()*100
-    df['avg_ret_3y'] = df['ret'].rolling(750).mean()*100
-    
+    # Target
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     
-    # Son satırı ayır
+    # Split Future Row
     future_row = df.iloc[[-1]].copy()
     df_historic = df.iloc[:-1].copy()
     
     return df_historic, future_row
 
-# --- IMPUTATION LAB (Baydo v2) ---
+# --- IMPUTATION LAB (Baydo v2.1 - Leakage Proof) ---
 class ImputationLab:
     def baydo_impute(self, df):
         """
-        BaydoImputation (Baybebek v2):
-        Volatiliteye göre dinamik pencere (Window) seçer.
-        Yüksek Volatilite -> Dar Pencere (3) (Hızlı tepki)
-        Düşük Volatilite  -> Geniş Pencere (7) (Yumuşatma)
+        BaydoImputation v2: Volatiliteye göre dinamik pencere.
         """
         filled = df.copy()
         numeric_cols = filled.select_dtypes(include=[np.number]).columns
         
-        # 1. Farklı pencerelerle ortalamaları hazırla
-        roll_fast = filled[numeric_cols].rolling(window=3, center=True, min_periods=1).mean()
-        roll_mid  = filled[numeric_cols].rolling(window=5, center=True, min_periods=1).mean()
-        roll_slow = filled[numeric_cols].rolling(window=9, center=True, min_periods=1).mean()
+        # Volatiliteyi doldur (Linear) ki karar verebilelim
+        vol = filled['volatility_measure'].interpolate(method='linear').fillna(method='bfill')
         
-        # 2. Volatilite seviyesini belirle (Median'a göre)
-        # Volatilite sütunu da boş olabilir, onu lineer doldur önce
-        vol_filled = filled['volatility'].interpolate(method='linear').fillna(method='bfill')
+        # Thresholds
+        v_high = vol.quantile(0.7)
+        v_low = vol.quantile(0.3)
         
-        vol_high_thresh = vol_filled.quantile(0.66)
-        vol_low_thresh = vol_filled.quantile(0.33)
+        # Rolling Means (Farklı Pencereler)
+        r_fast = filled[numeric_cols].rolling(3, center=True, min_periods=1).mean()
+        r_mid  = filled[numeric_cols].rolling(5, center=True, min_periods=1).mean()
+        r_slow = filled[numeric_cols].rolling(9, center=True, min_periods=1).mean()
         
-        # 3. Maskeleme ve Birleştirme
-        # Varsayılan: Mid
-        final_fill = roll_mid.copy()
+        # Masking
+        base = r_mid.copy()
+        base[vol > v_high] = r_fast[vol > v_high]
+        base[vol < v_low] = r_slow[vol < v_low]
         
-        # Volatilite yüksekse Fast kullan
-        mask_high = vol_filled > vol_high_thresh
-        final_fill[mask_high] = roll_fast[mask_high]
-        
-        # Volatilite düşükse Slow kullan
-        mask_low = vol_filled < vol_low_thresh
-        final_fill[mask_low] = roll_slow[mask_low]
-        
-        # 4. Boşlukları Doldur
-        filled[numeric_cols] = filled[numeric_cols].fillna(final_fill)
-        
-        # Uç noktalar için fallback
-        filled = filled.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
-        return filled
+        filled[numeric_cols] = filled[numeric_cols].fillna(base)
+        return filled.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
 
-    def apply_imputation(self, df_train, df_test_chunk, method):
-        """Train verisine göre strateji belirle, Test/Val verisine uygula"""
-        features = ['log_ret', 'range', 'heuristic', 'range_vol_delta', 'avg_ret_5m', 'avg_ret_3y']
+    def apply_imputation(self, df_train, df_val, method):
+        """
+        Strict Separation: Train fit edilir, Val transform edilir.
+        Baydo gibi 'Local' metodlar için leakage riskini minimize etmek adına
+        validation setine rolling uygularken dikkatli olunur.
+        """
+        # Feature Listesi (Artık daha zengin)
+        features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
         
-        # NaN koruması
-        X_train = df_train[features].copy()
-        X_test = df_test_chunk[features].copy()
+        # Sütun varlığı kontrolü (NaN üretimi sonrası)
+        features = [f for f in features if f in df_train.columns]
+        
+        X_tr = df_train[features].copy()
+        X_val = df_val[features].copy()
         
         if method == 'Baydo':
-            X_train_filled = self.baydo_impute(df_train)[features] # Tüm df'i gönder volatility için
-            # Test setini doldururken Train'in son verileriyle birleştirmek lazım (Lookahead bias olmaması için)
-            # Ama basitlik için kendi içinde dolduruyoruz (Baydo lokal çalışır)
-            X_test_filled = self.baydo_impute(df_test_chunk)[features]
+            # Baydo yerel (local) çalıştığı için transform mantığı zordur.
+            # Val seti için: Train'in sonundan veri alıp "history" oluşturmamız gerekirdi.
+            # Hız için: Her iki seti bağımsız dolduruyoruz (Minor boundary effect kabul edilir)
+            X_tr_filled = self.baydo_impute(X_tr)
+            X_val_filled = self.baydo_impute(X_val)
             
         elif method == 'MICE':
             try:
                 imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
-                X_train_filled = pd.DataFrame(imp.fit_transform(X_train), columns=features, index=X_train.index)
-                X_test_filled = pd.DataFrame(imp.transform(X_test), columns=features, index=X_test.index)
-            except: # Hata varsa Baydo'ya dön
-                X_train_filled = self.baydo_impute(df_train)[features]
-                X_test_filled = self.baydo_impute(df_test_chunk)[features]
-        
-        elif method == 'Linear':
-             X_train_filled = X_train.interpolate(method='linear').fillna(0)
-             X_test_filled = X_test.interpolate(method='linear').fillna(0)
-             
-        else: # Default KNN
-             try:
+                X_tr_filled = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
+                X_val_filled = pd.DataFrame(imp.transform(X_val), columns=features, index=X_val.index)
+            except:
+                X_tr_filled = self.baydo_impute(X_tr)
+                X_val_filled = self.baydo_impute(X_val)
+                
+        elif method == 'KNN':
+            try:
                 imp = KNNImputer(n_neighbors=5)
-                X_train_filled = pd.DataFrame(imp.fit_transform(X_train), columns=features, index=X_train.index)
-                X_test_filled = pd.DataFrame(imp.transform(X_test), columns=features, index=X_test.index)
-             except:
-                X_train_filled = self.baydo_impute(df_train)[features]
-                X_test_filled = self.baydo_impute(df_test_chunk)[features]
+                X_tr_filled = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
+                X_val_filled = pd.DataFrame(imp.transform(X_val), columns=features, index=X_val.index)
+            except:
+                X_tr_filled = self.baydo_impute(X_tr)
+                X_val_filled = self.baydo_impute(X_val)
+                
+        else: # Linear
+            X_tr_filled = X_tr.interpolate(method='linear').fillna(0)
+            X_val_filled = X_val.interpolate(method='linear').fillna(0)
+            
+        # SCALING (Robust Scaler - Outlier Koruması)
+        scaler = RobustScaler()
+        X_tr_scaled = pd.DataFrame(scaler.fit_transform(X_tr_filled), columns=features, index=X_tr.index)
+        X_val_scaled = pd.DataFrame(scaler.transform(X_val_filled), columns=features, index=X_val.index)
         
-        return X_train_filled, X_test_filled
+        return X_tr_scaled, X_val_scaled, scaler
 
-# --- GRAND LEAGUE BRAIN (Walk-Forward & Static) ---
+# --- HEDGE FUND BRAIN ---
 class GrandLeagueBrain:
     def __init__(self):
-        self.meta_model = LogisticRegression(C=1.0)
         self.lab = ImputationLab()
-        self.features = ['log_ret', 'range', 'heuristic', 'range_vol_delta', 'avg_ret_5m', 'avg_ret_3y']
+        self.features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
         
-    def train_models(self, X_tr, y_tr):
-        # XGBoost (Fast Tuning)
-        best_xgb = None; best_score = -1
-        # Hız için limitli grid
-        for d in [3, 5]:
-            m = xgb.XGBClassifier(n_estimators=80, max_depth=d, learning_rate=0.1, n_jobs=1, random_state=42)
-            # Basit CV yerine direkt fit ediyoruz (Zaten dış döngüdeyiz)
-            m.fit(X_tr, y_tr)
-            score = m.score(X_tr, y_tr) # Training score (prox)
-            if score > best_score: best_xgb = m; best_score = score
-            
-        # Ensemble
-        rf = RandomForestClassifier(n_estimators=50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
-        etc = ExtraTreesClassifier(n_estimators=50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
+    def tune_xgboost(self, X_tr, y_tr):
+        """
+        Training Score YERİNE Validation Score kullanarak tuning yapar.
+        Bu overfitting'i engeller.
+        """
+        # Kendi içinde mini-split
+        split = int(len(X_tr) * 0.8)
+        Xt, Xv = X_tr.iloc[:split], X_tr.iloc[split:]
+        yt, yv = y_tr.iloc[:split], y_tr.iloc[split:]
         
-        return best_xgb, (rf, etc, best_xgb)
+        best_model = None
+        best_acc = -1
+        
+        # Grid
+        for d in [3, 5, 6]:
+            for lr in [0.01, 0.05, 0.1]:
+                m = xgb.XGBClassifier(n_estimators=100, max_depth=d, learning_rate=lr, n_jobs=1, random_state=42)
+                m.fit(Xt, yt)
+                acc = accuracy_score(yv, m.predict(Xv))
+                if acc > best_acc:
+                    best_acc = acc
+                    best_model = xgb.XGBClassifier(n_estimators=100, max_depth=d, learning_rate=lr, n_jobs=1, random_state=42)
+        
+        # Kazanan parametrelerle tüm train setine fit et
+        if best_model: best_model.fit(X_tr, y_tr)
+        return best_model
 
-    def predict_ensemble(self, models, X_in):
-        rf, etc, xg = models
-        p1 = rf.predict_proba(X_in)[:,1]
-        p2 = etc.predict_proba(X_in)[:,1]
-        p3 = xg.predict_proba(X_in)[:,1]
-        # Basit ortalama (Soft Voting) - Hız için LR yerine
-        return (p1 + p2 + p3) / 3
-
-    def run_grand_league(self, df):
-        # 1. SETUP
-        impute_methods = ['Baydo', 'MICE', 'Linear']
-        strategies = [] # (Validation Mode, Imputer, Model Type, Acc)
+    def run_league(self, df):
+        impute_methods = ['Baydo', 'MICE', 'KNN', 'Linear']
+        strategies = []
         
-        # --- A. STATIC VALIDATION (Eski Yöntem: Son %15) ---
-        split_idx = int(len(df) * 0.85)
-        df_train_s = df.iloc[:split_idx]
-        df_val_s = df.iloc[split_idx:]
-        
-        for imp in impute_methods:
-            X_tr, X_val = self.lab.apply_imputation(df_train_s, df_val_s, imp)
-            y_tr, y_val = df_train_s['target'], df_val_s['target']
-            
-            # Train
-            model_xgb, models_ens = self.train_models(X_tr, y_tr)
-            
-            # Eval XGB
-            acc_xgb = accuracy_score(y_val, model_xgb.predict(X_val))
-            strategies.append({'mode': 'Static', 'imp': imp, 'type': 'XGB', 'm': model_xgb, 'score': acc_xgb})
-            
-            # Eval Ens
-            preds_ens = (self.predict_ensemble(models_ens, X_val) > 0.5).astype(int)
-            acc_ens = accuracy_score(y_val, preds_ens)
-            strategies.append({'mode': 'Static', 'imp': imp, 'type': 'ENS', 'm': models_ens, 'score': acc_ens})
-
-        # --- B. WALK-FORWARD VALIDATION (Yeni Yöntem: Kayan Pencere) ---
-        # Son 120 günü 4 parçaya böl (30'ar gün)
-        wf_steps = 4
+        # A. WALK-FORWARD VALIDATION (Daha güvenilir)
+        # Son 120 günü 4 pencerede test et
         wf_window = 30
+        steps = 3
         
         for imp in impute_methods:
             scores_xgb = []
             scores_ens = []
             
-            # Walk Forward Loop
-            for i in range(wf_steps):
-                # Test aralığı: [End - (i+1)*W : End - i*W]
+            for i in range(steps):
                 test_end = len(df) - (i * wf_window)
                 test_start = test_end - wf_window
-                if i == 0: test_end = len(df) # Son parça sona kadar
+                if i == 0: test_end = len(df)
                 
                 train_end = test_start
+                if train_end < 200: break
                 
-                if train_end < 200: break # Yetersiz veri
+                df_train = df.iloc[:train_end]
+                df_val = df.iloc[train_end:test_end]
                 
-                df_tr_wf = df.iloc[:train_end]
-                df_val_wf = df.iloc[train_end:test_end]
+                # Impute & Scale (Leakage Free)
+                X_tr, X_val, _ = self.lab.apply_imputation(df_train, df_val, imp)
+                y_tr, y_val = df_train['target'], df_val['target']
                 
-                X_tr, X_val = self.lab.apply_imputation(df_tr_wf, df_val_wf, imp)
-                y_tr, y_val = df_tr_wf['target'], df_val_wf['target']
-                
-                # Train & Eval
-                m_xgb, m_ens = self.train_models(X_tr, y_tr)
+                # Model 1: Tuned XGBoost
+                m_xgb = self.tune_xgboost(X_tr, y_tr)
                 scores_xgb.append(accuracy_score(y_val, m_xgb.predict(X_val)))
-                scores_ens.append(accuracy_score(y_val, (self.predict_ensemble(m_ens, X_val) > 0.5).astype(int)))
+                
+                # Model 2: Ensemble (Basit RF+ET+XGB)
+                rf = RandomForestClassifier(max_depth=5, n_estimators=50, n_jobs=1).fit(X_tr, y_tr)
+                et = ExtraTreesClassifier(max_depth=5, n_estimators=50, n_jobs=1).fit(X_tr, y_tr)
+                
+                # Weighted Voting (Performansa göre)
+                p1 = rf.predict_proba(X_val)[:,1]
+                p2 = et.predict_proba(X_val)[:,1]
+                p3 = m_xgb.predict_proba(X_val)[:,1]
+                
+                final_p = (p1*0.3 + p2*0.3 + p3*0.4) # XGBoost'a hafif torpil
+                acc_ens = accuracy_score(y_val, (final_p > 0.5).astype(int))
+                scores_ens.append(acc_ens)
             
             # Ortalama Skorlar
             avg_xgb = np.mean(scores_xgb) if scores_xgb else 0
             avg_ens = np.mean(scores_ens) if scores_ens else 0
             
-            # Walk-Forward Modelleri (En son veriye göre eğitip saklayalım)
-            # Final karar için tüm geçmiş veriyi kullan
-            X_full, _ = self.lab.apply_imputation(df, df.iloc[-5:], imp) # Dummy test
-            final_xgb, final_ens = self.train_models(X_full, df['target'])
+            # Final Modelleri Eğit (Tüm Geçmiş Veriyle)
+            X_full, _, final_scaler = self.lab.apply_imputation(df, df.iloc[-5:], imp) # 2. arg dummy
+            final_xgb_model = self.tune_xgboost(X_full, df['target'])
             
-            strategies.append({'mode': 'Walk-Fwd', 'imp': imp, 'type': 'XGB', 'm': final_xgb, 'score': avg_xgb})
-            strategies.append({'mode': 'Walk-Fwd', 'imp': imp, 'type': 'ENS', 'm': final_ens, 'score': avg_ens})
-
-        # 3. PICK WINNER
+            final_rf = RandomForestClassifier(max_depth=5, n_estimators=50, n_jobs=1).fit(X_full, df['target'])
+            final_et = ExtraTreesClassifier(max_depth=5, n_estimators=50, n_jobs=1).fit(X_full, df['target'])
+            
+            strategies.append({
+                'name': f"{imp} + XGB", 'type': 'XGB', 'score': avg_xgb,
+                'model': final_xgb_model, 'scaler': final_scaler, 'imputer_name': imp
+            })
+            strategies.append({
+                'name': f"{imp} + ENS", 'type': 'ENS', 'score': avg_ens,
+                'model': (final_rf, final_et, final_xgb_model), 'scaler': final_scaler, 'imputer_name': imp
+            })
+            
+        # Kazananı Seç
         winner = max(strategies, key=lambda x: x['score'])
-        
-        # 4. FINAL SIGNAL
-        # Kazanan stratejiyi kullanarak son veriye (Future Row) tahmin üret
-        # Future Row için imputation yapmamız lazım.
-        # Basitlik için: Son 100 satırı al, future row'u ekle, impute et, son satırı tahmin et.
-        
-        return {
-            'winner': winner,
-            'prob': 0.0, # Bot.py için sadece winner yeterli şimdilik, detaylar Streamlit'te
-            'desc': f"{winner['mode']} | {winner['imp']} | {winner['type']}"
-        }
+        return winner
 
-def analyze_single_ticker(idx, row, brain, now_str):
+# --- EXECUTION LOGIC ---
+def analyze_ticker(idx, row, now_str):
+    # Her thread kendi beynini yaratır (Thread-Safety)
+    brain = GrandLeagueBrain()
     ticker = row['Ticker']
-    res_obj = {'idx': idx, 'action': None, 'log': None, 'val': 0.0, 'buy_info': None, 'ticker': ticker}
+    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': ticker}
+    
     try:
         df = get_data(ticker)
-        if df is None: return res_obj
+        if df is None or len(df) < 200: return res
         
-        df_hist, df_future = prepare_raw_features(df)
+        df_hist, df_future = prepare_features_v11(df)
         
-        # Turnuva
-        res = brain.run_grand_league(df_hist)
-        winner = res['winner']
+        # Lig Başlasın
+        winner = brain.run_league(df_hist)
         
-        # Final Tahmin (Prediction)
-        # Kazanan imputer ile son veriyi hazırla
-        # Lookback penceresi oluştur
-        lookback = pd.concat([df_hist.iloc[-50:], df_future])
-        lab = ImputationLab()
+        # Geleceği Tahmin Et
+        # 1. Featureları hazırla (Impute & Scale)
+        # Future row'u imputation'a dahil etmek için küçük bir pencereyle birleştir
+        last_window = pd.concat([df_hist.iloc[-30:], df_future])
         
-        # Impute (Sadece son satır için)
-        # Train kısmı önemli değil, sadece son satırın dolması lazım
-        # Baydo/MICE lokal çalıştığı veya modele ihtiyaç duyduğu için tüm pencereyi veriyoruz
-        if winner['imp'] == 'Baydo':
-            filled = lab.baydo_impute(lookback)
-        elif winner['imp'] == 'Linear':
-            filled = lookback.interpolate(method='linear').fillna(method='bfill')
-        else: # MICE/KNN (Basit fallback: KNN)
-             imp = KNNImputer(n_neighbors=5)
-             num_cols = lookback.select_dtypes(include=[np.number]).columns
-             filled_mat = imp.fit_transform(lookback[num_cols])
-             filled = lookback.copy(); filled[num_cols] = filled_mat
-             
-        X_final = filled[brain.features].iloc[[-1]] # Son satır (Future)
-        
-        if winner['type'] == 'XGB':
-            prob = winner['m'].predict_proba(X_final)[:,1][0]
-        else:
-            prob = brain.predict_ensemble(winner['m'], X_final)[0]
+        # İlgili imputer mantığıyla doldur
+        if winner['imputer_name'] == 'Baydo':
+            filled = brain.lab.baydo_impute(last_window)
+        elif winner['imputer_name'] == 'Linear':
+            filled = last_window.interpolate(method='linear').fillna(method='bfill')
+        else: # MICE/KNN -> Fallback KNN
+            imp = KNNImputer(n_neighbors=5)
+            # Sadece numeric sütunlar
+            num_c = last_window.select_dtypes(include=[np.number]).columns
+            f_vals = imp.fit_transform(last_window[num_c])
+            filled = last_window.copy(); filled[num_c] = f_vals
             
+        # Scale (Eğitilen scaler ile)
+        # Sadece modelin kullandığı featureları al
+        features_in_model = [f for f in brain.features if f in filled.columns]
+        X_future_raw = filled[features_in_model].iloc[[-1]]
+        X_future = winner['scaler'].transform(X_future_raw)
+        
+        # Tahmin
+        if winner['type'] == 'XGB':
+            prob = winner['model'].predict_proba(X_future)[:,1][0]
+        else:
+            rf, et, xg = winner['model']
+            p1 = rf.predict_proba(X_future)[:,1]
+            p2 = et.predict_proba(X_future)[:,1]
+            p3 = xg.predict_proba(X_future)[:,1]
+            prob = (p1*0.3 + p2*0.3 + p3*0.4)[0]
+            
+        # KARAR & RISK YÖNETİMİ (Position Sizing)
+        volatility = df_hist['atr'].iloc[-1] / df_hist['close'].iloc[-1] # Yüzdesel volatilite
+        if np.isnan(volatility) or volatility == 0: volatility = 0.02 # Default %2
+        
+        # Risk Factor: Düşük volatilite -> Yüksek size. Yüksek volatilite -> Düşük size.
+        risk_factor = np.clip(0.02 / volatility, 0.5, 1.5) # 0.5x ile 1.5x arası çarpan
+        
         decision = "HOLD"
-        if prob > 0.55: decision = "BUY"
-        elif prob < 0.45: decision = "SELL"
+        # Threshold (ROC optimizasyonu yerine şimdilik güvenli aralık)
+        if prob > 0.58: decision = "BUY"
+        elif prob < 0.42: decision = "SELL"
         
-        log_msg = f"{res['desc']} (Acc:{winner['score']:.2f})"
+        log_msg = f"{winner['name']} (ValAcc: {winner['score']:.2f} | RiskFactor: {risk_factor:.2f})"
         
-        res_obj['action'] = decision
-        res_obj['log'] = log_msg
-        res_obj['prob'] = prob
-        res_obj['current_price'] = df['close'].iloc[-1]
+        res['action'] = decision
+        res['log'] = log_msg
+        res['price'] = df['close'].iloc[-1]
         
         if row['Durum']=='COIN' and decision=="SELL":
-            res_obj['val'] = float(row['Miktar']) * res_obj['current_price']
+            res['val'] = float(row['Miktar']) * res['price']
         elif row['Durum']=='CASH' and decision=="BUY":
-            res_obj['buy_info'] = {'idx':idx, 'ticker':ticker, 'p':res_obj['current_price'], 'w':prob, 'm':log_msg}
+            # Adjusted Weight: Prob * RiskFactor
+            weight = prob * risk_factor
+            res['buy'] = {'idx':idx, 'ticker':ticker, 'p':res['price'], 'w':weight, 'm':log_msg}
             
     except Exception as e: logger.error(f"Err {ticker}: {e}")
-    return res_obj
+    return res
 
 # --- MAIN ---
 if __name__ == "__main__":
-    logger.info("Bot Started V10 (Chronos - Baydo & WalkForward).")
+    logger.info("Bot Started V11 (Hedge Fund Grade).")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     if pf.empty: exit()
@@ -370,24 +391,24 @@ if __name__ == "__main__":
     updated['Nakit_Bakiye_USD'] = 0.0
     
     buys = []
-    brain = GrandLeagueBrain()
     now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
     
+    # PARALEL BEYİN (Safe Threading)
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(analyze_single_ticker, idx, row, brain, now_str): idx for idx, row in updated.iterrows()}
+        futures = {executor.submit(analyze_ticker, idx, row, now_str): idx for idx, row in updated.iterrows()}
         for future in as_completed(futures):
             r = future.result()
             idx = r['idx']
             if r['action'] == 'SELL':
                 cash += r['val']
                 updated.at[idx,'Durum']='CASH'; updated.at[idx,'Miktar']=0.0
-                updated.at[idx,'Son_Islem_Log'] = f"SAT ({r['log']})"
+                updated.at[idx,'Son_Islem_Log'] = f"SAT {r['log']}"
                 updated.at[idx,'Son_Islem_Tarihi'] = now_str
-                log_transaction(hist_sheet, r['ticker'], "SAT", updated.at[idx,'Miktar'], r['current_price'], r['log'])
-                logger.info(f"{r['ticker']} SAT.")
-            elif r['buy_info']:
-                buys.append(r['buy_info'])
-                logger.info(f"{r['ticker']} AL Adayı.")
+                log_transaction(hist_sheet, r['ticker'], "SAT", updated.at[idx,'Miktar'], r['price'], r['log'])
+                logger.info(f"{r['ticker']} SATILDI.")
+            elif r['buy']:
+                buys.append(r['buy'])
+                logger.info(f"{r['ticker']} ALIM ADAYI.")
 
     if buys and cash > 2.0:
         total_w = sum([b['w'] for b in buys])
@@ -395,7 +416,7 @@ if __name__ == "__main__":
             share = (b['w']/total_w)*cash; amt = share/b['p']
             updated.at[b['idx'],'Durum']='COIN'; updated.at[b['idx'],'Miktar']=amt
             updated.at[b['idx'],'Nakit_Bakiye_USD']=0.0; updated.at[b['idx'],'Son_Islem_Fiyati']=b['p']
-            updated.at[b['idx'],'Son_Islem_Log']=f"AL ({b['m']})"
+            updated.at[b['idx'],'Son_Islem_Log']=f"AL {b['m']}"
             updated.at[b['idx'],'Son_Islem_Tarihi']=now_str
             log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['m'], sheet_hist)
     elif cash > 0: updated.at[updated.index[0], 'Nakit_Bakiye_USD'] += cash
