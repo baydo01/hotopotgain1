@@ -10,7 +10,7 @@ import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- ML & AUTOML LIBRARIES ---
-from sklearn.experimental import enable_iterative_imputer # MICE için gerekli
+from sklearn.experimental import enable_iterative_imputer # MICE için şart
 from sklearn.impute import IterativeImputer, KNNImputer
 from sklearn.linear_model import BayesianRidge, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
@@ -67,50 +67,87 @@ def log_transaction(sheet, ticker, action, amount, price, model):
         try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
         except: pass
 
-# --- AUTOML CORE ---
+# --- AUTOML CORE (HATA KORUMALI) ---
 class DataArchitect:
     def find_best_imputer(self, df, features):
-        """Verinin %10'unu saklayıp KNN, MICE ve Linear Interpolation yarıştırır."""
-        test_df = df[features].copy()
-        mask = np.random.choice([True, False], size=test_df.shape, p=[0.1, 0.9])
-        ground_truth = test_df.values.copy()
-        test_df.values[mask] = np.nan # Veriyi boz
+        """
+        Zırhlı Imputer Seçicisi: MICE/KNN hata verirse Linear'a düşer.
+        """
+        # Sonsuz değerleri temizle
+        df = df.replace([np.inf, -np.inf], np.nan)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         
+        # Test seti oluştur (%10 gizle)
+        try:
+            test_df = df[features].copy()
+            mask = np.random.choice([True, False], size=test_df.shape, p=[0.1, 0.9])
+            ground_truth = test_df.values.copy()
+            sim_df = test_df.copy()
+            sim_df.values[mask] = np.nan
+        except:
+            # Veri çok küçükse direkt Linear dön
+            return df.interpolate(method='linear').fillna(method='bfill'), "Linear (Fallback)"
+
         results = {}
-        # 1. MICE
+        
+        # 1. MICE Testi
         try:
-            mice_filled = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42).fit_transform(test_df)
-            results['MICE'] = np.sqrt(mean_squared_error(ground_truth[mask], mice_filled[mask]))
-        except: results['MICE'] = 999
-        # 2. KNN
+            imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
+            # Sadece feature sütunları üzerinde test ediyoruz
+            filled = imp.fit_transform(sim_df)
+            if filled.shape == sim_df.shape:
+                results['MICE'] = np.sqrt(mean_squared_error(ground_truth[mask], filled[mask]))
+            else: results['MICE'] = 999.0
+        except: results['MICE'] = 999.0
+
+        # 2. KNN Testi
         try:
-            knn_filled = KNNImputer(n_neighbors=5).fit_transform(test_df)
-            results['KNN'] = np.sqrt(mean_squared_error(ground_truth[mask], knn_filled[mask]))
-        except: results['KNN'] = 999
-        # 3. Linear
+            imp = KNNImputer(n_neighbors=5)
+            filled = imp.fit_transform(sim_df)
+            if filled.shape == sim_df.shape:
+                results['KNN'] = np.sqrt(mean_squared_error(ground_truth[mask], filled[mask]))
+            else: results['KNN'] = 999.0
+        except: results['KNN'] = 999.0
+        
+        # 3. Linear Testi
         try:
-            lin_filled = test_df.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill').values
-            results['Linear'] = np.sqrt(mean_squared_error(ground_truth[mask], lin_filled[mask]))
-        except: results['Linear'] = 999
+            filled = sim_df.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill').values
+            results['Linear'] = np.sqrt(mean_squared_error(ground_truth[mask], filled[mask]))
+        except: results['Linear'] = 999.0
         
         winner = min(results, key=results.get)
         final_df = df.copy()
         
-        # Kazanan yöntemi uygula
-        if winner == 'MICE':
-            final_df[features] = IterativeImputer(estimator=BayesianRidge(), max_iter=10).fit_transform(df[features])
-        elif winner == 'KNN':
-            final_df[features] = KNNImputer(n_neighbors=5).fit_transform(df[features])
-        else:
-            final_df[features] = df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+        # KAZANANI UYGULA (Hata Korumalı)
+        try:
+            if winner == 'MICE':
+                imputer = IterativeImputer(estimator=BayesianRidge(), max_iter=10)
+                filled_data = imputer.fit_transform(final_df[numeric_cols])
+                if filled_data.shape[1] == len(numeric_cols): final_df[numeric_cols] = filled_data
+                else: raise ValueError("MICE Shape Mismatch")
+            elif winner == 'KNN':
+                imputer = KNNImputer(n_neighbors=5)
+                filled_data = imputer.fit_transform(final_df[numeric_cols])
+                if filled_data.shape[1] == len(numeric_cols): final_df[numeric_cols] = filled_data
+                else: raise ValueError("KNN Shape Mismatch")
+            else:
+                final_df[features] = final_df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+        except:
+            winner = "Linear (Emergency)"
+            final_df[features] = final_df[features].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+            final_df = final_df.fillna(0)
             
         return final_df, winner
 
-def process_data(df):
+def process_data_automl(df):
     if len(df) < 150: return None, None
     df = df.copy()
     
-    # Feature Engineering
+    # 1. Temel Temizlik
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df.fillna(method='ffill', inplace=True)
+    
+    # 2. Feature Engineering
     df['kalman'] = df['close'].rolling(3).mean()
     df['log_ret'] = np.log(df['kalman']/df['kalman'].shift(1))
     df['ret'] = df['close'].pct_change()
@@ -120,13 +157,16 @@ def process_data(df):
     
     df['avg_ret_5m'] = df['ret'].rolling(100).mean()*100
     df['avg_ret_3y'] = df['ret'].rolling(750).mean()*100
-    avg_feats = df[['avg_ret_5m','avg_ret_3y']].fillna(0)
-    df['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
+    
+    try:
+        avg_feats = df[['avg_ret_5m','avg_ret_3y']].fillna(0)
+        df['historical_avg_score'] = StandardScaler().fit_transform(avg_feats).mean(axis=1)
+    except: df['historical_avg_score'] = 0
     
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-    
-    # AutoML: Imputation
     features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
+    
+    # 3. AutoML Temizlik
     architect = DataArchitect()
     df_clean, imp_winner = architect.find_best_imputer(df, features)
     
@@ -138,52 +178,40 @@ class Brain:
         self.meta = LogisticRegression(C=1.0)
         
     def optimize_xgboost(self, X_tr, y_tr):
-        """XGBoost için Grid Search yapar."""
-        depths = [3, 5, 7]
-        lrs = [0.01, 0.1, 0.2]
-        best_score = -1; best_model = None; best_desc = ""
-        
-        # Validation Split
-        v_idx = int(len(X_tr)*0.8)
-        X_t, X_v = X_tr.iloc[:v_idx], X_tr.iloc[v_idx:]
-        y_t, y_v = y_tr.iloc[:v_idx], y_tr.iloc[v_idx:]
+        """XGBoost Grid Search"""
+        depths, lrs = [3, 5, 7], [0.01, 0.1, 0.2]
+        best_score, best_model, best_desc = -1, None, ""
+        v = int(len(X_tr)*0.8)
+        X_t, X_v, y_t, y_v = X_tr.iloc[:v], X_tr.iloc[v:], y_tr.iloc[:v], y_tr.iloc[v:]
         
         for d in depths:
             for lr in lrs:
                 m = xgb.XGBClassifier(n_estimators=100, max_depth=d, learning_rate=lr, random_state=42)
                 m.fit(X_t, y_t)
                 s = m.score(X_v, y_v)
-                if s > best_score:
-                    best_score = s; best_model = m; best_desc = f"d={d},lr={lr}"
-        
+                if s > best_score: best_score=s; best_model=m; best_desc=f"d={d},lr={lr}"
         best_model.fit(X_tr, y_tr)
         return best_model, best_desc
 
     def run_tournament(self, df, imp_info):
         features = ['log_ret', 'range', 'heuristic', 'historical_avg_score', 'range_vol_delta']
         test_size = 60
-        train = df.iloc[:-test_size]; test = df.iloc[-test_size:]
-        X_tr = train[features]; y_tr = train['target']
+        train, test = df.iloc[:-test_size], df.iloc[-test_size:]
+        X_tr, y_tr = train[features], train['target']
         X_test = test[features]
         
-        # 1. Base Models
         rf = RandomForestClassifier(n_estimators=100, max_depth=5).fit(X_tr, y_tr)
         etc = ExtraTreesClassifier(n_estimators=100, max_depth=5).fit(X_tr, y_tr)
-        
-        # 2. Optimized XGB
         opt_xgb, xgb_params = self.optimize_xgboost(X_tr, y_tr)
         
-        # 3. HMM
         try:
             scaler = StandardScaler()
             X_hmm = scaler.fit_transform(train[['log_ret', 'range_vol_delta']].fillna(0))
             hmm = GaussianHMM(n_components=3, covariance_type='diag', n_iter=50).fit(X_hmm)
             hmm_probs = hmm.predict_proba(X_hmm)[:,0]
-            X_hmm_t = scaler.transform(test[['log_ret', 'range_vol_delta']].fillna(0))
-            hmm_probs_t = hmm.predict_proba(X_hmm_t)[:,0]
+            hmm_probs_t = hmm.predict_proba(scaler.transform(test[['log_ret', 'range_vol_delta']].fillna(0)))[:,0]
         except: hmm_probs=np.zeros(len(train)); hmm_probs_t=np.zeros(len(test))
         
-        # 4. Ensemble
         meta_X = pd.DataFrame({'RF': rf.predict_proba(X_tr)[:,1], 'ETC': etc.predict_proba(X_tr)[:,1], 
                                'XGB': opt_xgb.predict_proba(X_tr)[:,1], 'HMM': hmm_probs}, index=train.index).fillna(0)
         self.meta.fit(meta_X, y_tr)
@@ -194,14 +222,14 @@ class Brain:
         p_ens = self.meta.predict_proba(meta_X_test)[:,1]
         p_solo = opt_xgb.predict_proba(X_test)[:,1]
         
-        sim_ens = 100.0; sim_solo = 100.0
+        sim_ens, sim_solo = 100.0, 100.0
         rets = test['close'].pct_change().fillna(0).values
         for i in range(len(test)):
-            if p_ens[i] > 0.55: sim_ens *= (1+rets[i])
-            if p_solo[i] > 0.55: sim_solo *= (1+rets[i])
+            if p_ens[i]>0.55: sim_ens*=(1+rets[i])
+            if p_solo[i]>0.55: sim_solo*=(1+rets[i])
             
         winner = "Solo Optimized XGB" if sim_solo > sim_ens else "Ensemble"
-        prob = p_solo[-1] if winner == "Solo Optimized XGB" else p_ens[-1]
+        prob = p_solo[-1] if winner=="Solo Optimized XGB" else p_ens[-1]
         
         return prob, winner, imp_info, xgb_params
 
@@ -216,7 +244,7 @@ def analyze_single_ticker(idx, row, brain, now_str):
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
         
-        df_processed, imp_info = process_data(df)
+        df_processed, imp_info = process_data_automl(df)
         if df_processed is not None:
             prob, winner, imp_method, xgb_p = brain.run_tournament(df_processed, imp_info)
             
@@ -228,8 +256,8 @@ def analyze_single_ticker(idx, row, brain, now_str):
             result['action'] = decision
             result['log'] = log_msg
             result['current_price'] = df['close'].iloc[-1]
+            result['prob'] = prob
             
-            # Logic
             if row['Durum']=='COIN' and decision=="SELL":
                 val = float(row['Miktar']) * result['current_price']
                 result['val'] = val
@@ -240,20 +268,20 @@ def analyze_single_ticker(idx, row, brain, now_str):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    logger.info("Bot Started V8 (Turbo/Parallel).")
+    logger.info("Bot Started V8.2 (AutoML + Turbo).")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     if pf.empty: exit()
     
     updated = pf.copy()
     cash = updated['Nakit_Bakiye_USD'].sum()
-    updated['Nakit_Bakiye_USD'] = 0.0 # Bakiye sıfırla (Double spend koruması)
+    updated['Nakit_Bakiye_USD'] = 0.0 # Sonsuz para hatası fix
     
     buys = []
     brain = Brain()
     now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
     
-    # PARALEL İŞLEME (5 Çekirdek Kullanır)
+    # PARALEL İŞLEME (5 Coin aynı anda)
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(analyze_single_ticker, idx, row, brain, now_str): idx for idx, row in updated.iterrows()}
         
@@ -268,7 +296,7 @@ if __name__ == "__main__":
                 updated.at[idx, 'Son_Islem_Log'] = f"SAT ({res['log']})"
                 updated.at[idx, 'Son_Islem_Tarihi'] = now_str
                 log_transaction(hist_sheet, res['ticker'], "SAT", updated.at[idx, 'Miktar'], res['current_price'], res['log'])
-                logger.info(f"{res['ticker']} SAT.")
+                logger.info(f"{res['ticker']} SATILDI.")
                 
             elif res['buy_info']:
                 buys.append(res['buy_info'])
