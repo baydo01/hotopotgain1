@@ -47,15 +47,24 @@ def load_portfolio(sheet):
     data = sheet.get_all_records()
     if not data: return pd.DataFrame()
     df = pd.DataFrame(data)
+    
+    # Sayısal Dönüşüm
     cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for c in cols:
         if c in df.columns: df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+    
+    # --- YAMA: OTOMATİK SÜTUN OLUŞTURUCU ---
+    # Eğer bu sütunlar yoksa, DataFrame'e ekleriz (Save edince Sheet'te de oluşur)
     if 'Son_Islem_Tarihi' not in df.columns: df['Son_Islem_Tarihi'] = "-"
+    if 'Bot_Son_Kontrol' not in df.columns: df['Bot_Son_Kontrol'] = "-"
+    
     return df
 
 def save_portfolio(df, sheet):
     if sheet:
-        df_exp = df.copy().astype(str)
+        # NaN değerleri temizle
+        df_exp = df.copy().fillna("")
+        df_exp = df_exp.astype(str)
         sheet.clear()
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
 
@@ -95,17 +104,13 @@ def get_data(ticker):
 def prepare_features(df):
     df = df.copy().replace([np.inf, -np.inf], np.nan)
     df = add_technical_indicators(df)
-    
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     df['range'] = (df['high'] - df['low']) / df['close']
     df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-    
-    # NaN temizliği
     df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
-    
-    future = df.iloc[[-1]].copy() # Son satır (Yarın için featurelar hazır ama target yok)
-    hist = df.iloc[:-1].copy() # Geçmiş (Target var)
+    future = df.iloc[[-1]].copy()
+    hist = df.iloc[:-1].copy()
     return hist, future
 
 # --- IMPUTATION (Baydo v2) ---
@@ -113,31 +118,24 @@ class ImputationLab:
     def baydo_impute(self, df):
         filled = df.copy()
         num_cols = filled.select_dtypes(include=[np.number]).columns
-        
         vol = filled['volatility_measure'].interpolate(method='linear').fillna(method='bfill')
         v_high = vol.quantile(0.7); v_low = vol.quantile(0.3)
-        
         r_fast = filled[num_cols].rolling(3, center=True, min_periods=1).mean()
         r_mid = filled[num_cols].rolling(5, center=True, min_periods=1).mean()
         r_slow = filled[num_cols].rolling(9, center=True, min_periods=1).mean()
-        
         base = r_mid.copy()
         base[vol > v_high] = r_fast[vol > v_high]
         base[vol < v_low] = r_slow[vol < v_low]
-        
         filled[num_cols] = filled[num_cols].fillna(base)
         return filled.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
 
     def apply_imputation(self, df_train, df_test, method):
         features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
         features = [f for f in features if f in df_train.columns]
-        
-        X_tr = df_train[features].copy()
-        X_te = df_test[features].copy()
+        X_tr = df_train[features].copy(); X_te = df_test[features].copy()
         
         if method == 'Baydo':
-            X_tr = self.baydo_impute(X_tr)
-            X_te = self.baydo_impute(X_te)
+            X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
         elif method == 'MICE':
             try:
                 imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
@@ -172,7 +170,6 @@ class GrandLeagueBrain:
         Xt, Xv = X_tr.iloc[:split], X_tr.iloc[split:]
         yt, yv = y_tr.iloc[:split], y_tr.iloc[split:]
         best_m = None; best_s = -1
-        
         for d in [3, 5]:
             for lr in [0.05, 0.1]:
                 m = xgb.XGBClassifier(n_estimators=80, max_depth=d, learning_rate=lr, n_jobs=1, random_state=42)
@@ -186,8 +183,6 @@ class GrandLeagueBrain:
         impute_methods = ['Baydo', 'MICE', 'KNN', 'Linear']
         strategies = []
         wf_window = 30; steps = 3
-        
-        # Walk Forward Loop
         for imp in impute_methods:
             scores_xgb = []; scores_ens = []
             for i in range(steps):
@@ -195,26 +190,20 @@ class GrandLeagueBrain:
                 if i==0: test_end = len(df)
                 train_end = test_start
                 if train_end < 200: break
-                
                 df_tr = df.iloc[:train_end]; df_val = df.iloc[train_end:test_end]
                 X_tr, X_val, _ = self.lab.apply_imputation(df_tr, df_val, imp)
                 y_tr, y_val = df_tr['target'], df_val['target']
-                
                 m_xgb = self.tune_xgboost(X_tr, y_tr)
                 if m_xgb: scores_xgb.append(accuracy_score(y_val, m_xgb.predict(X_val)))
-                
                 rf = RandomForestClassifier(50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
                 et = ExtraTreesClassifier(50, max_depth=5, n_jobs=1).fit(X_tr, y_tr)
                 if m_xgb:
                     p = (rf.predict_proba(X_val)[:,1]*0.3 + et.predict_proba(X_val)[:,1]*0.3 + m_xgb.predict_proba(X_val)[:,1]*0.4)
                     scores_ens.append(accuracy_score(y_val, (p>0.5).astype(int)))
-            
             avg_x = np.mean(scores_xgb) if scores_xgb else 0
             strategies.append({'name': f"{imp} + XGB", 'type': 'XGB', 'score': avg_x, 'imputer_name': imp})
-            
             avg_e = np.mean(scores_ens) if scores_ens else 0
             strategies.append({'name': f"{imp} + ENS", 'type': 'ENS', 'score': avg_e, 'imputer_name': imp})
-            
         winner = max(strategies, key=lambda x: x['score'])
         return winner
 
@@ -223,24 +212,16 @@ def analyze_ticker(idx, row, now_str):
     brain = GrandLeagueBrain()
     ticker = row['Ticker']
     res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': ticker}
-    
     try:
         df = get_data(ticker)
         if df is None or len(df) < 200: return res
-        
         hist, future = prepare_features(df)
         winner = brain.run_league(hist)
         
-        # --- PREDICTION ENGINE (EKSİK PARÇA GİDERİLDİ) ---
-        # 1. Veriyi hazırla (Geçmiş + Gelecek)
         lookback = pd.concat([hist.iloc[-50:], future])
-        
-        # 2. Kazanan yönteme göre Impute & Scale (Yeniden fit ederek)
-        # Final train: Tüm tarihçe
         X_full, X_future_scaled, _ = brain.lab.apply_imputation(hist, future, winner['imputer_name'])
         y_full = hist['target']
         
-        # 3. Kazanan Modeli Eğit ve Tahmin Et
         if winner['type'] == 'XGB':
             model = brain.tune_xgboost(X_full, y_full)
             prob = model.predict_proba(X_future_scaled)[:,1][0]
@@ -253,15 +234,13 @@ def analyze_ticker(idx, row, now_str):
             p3 = m_xgb.predict_proba(X_future_scaled)[:,1]
             prob = (p1*0.3 + p2*0.3 + p3*0.4)[0]
             
-        # 4. Risk Yönetimi
-        volatility = hist['volatility_measure'].iloc[-1]
+        vol = hist['volatility_measure'].iloc[-1]
         target_vol = 0.04
-        if volatility == 0 or np.isnan(volatility): risk_factor = 1.0
-        else: risk_factor = np.clip(target_vol / volatility, 0.3, 2.0)
+        if vol==0 or np.isnan(vol): risk_factor = 1.0
+        else: risk_factor = np.clip(target_vol / vol, 0.3, 2.0)
         
-        # 5. Karar
         decision = "HOLD"
-        if prob > 0.58: decision = "BUY" # Threshold optimize edilebilir
+        if prob > 0.58: decision = "BUY"
         elif prob < 0.42: decision = "SELL"
         
         log_msg = f"{winner['name']} (Acc:{winner['score']:.2f} | P:{prob:.2f} | R:{risk_factor:.2f}x)"
@@ -280,7 +259,7 @@ def analyze_ticker(idx, row, now_str):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    logger.info("Bot Started V13 (Final Engine).")
+    logger.info("Bot Started V14 (System Check Active).")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     if pf.empty: exit()
@@ -288,9 +267,11 @@ if __name__ == "__main__":
     updated = pf.copy()
     cash = updated['Nakit_Bakiye_USD'].sum()
     updated['Nakit_Bakiye_USD'] = 0.0
-    
     buys = []
+    
+    # --- YAMA: KALP ATIŞI (HEARTBEAT) ---
     now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
+    updated['Bot_Son_Kontrol'] = now_str # Her çalışmada buraya imza atar
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(analyze_ticker, idx, row, now_str): idx for idx, row in updated.iterrows()}
@@ -319,6 +300,7 @@ if __name__ == "__main__":
             log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['m'], sheet_hist)
     elif cash > 0: updated.at[updated.index[0], 'Nakit_Bakiye_USD'] += cash
     
+    # Değerleme
     for idx, row in updated.iterrows():
         if row['Durum'] == 'COIN':
             try:
