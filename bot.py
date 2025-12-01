@@ -47,14 +47,11 @@ def load_portfolio(sheet):
     data = sheet.get_all_records()
     if not data: return pd.DataFrame()
     df = pd.DataFrame(data)
-    
-    # Sayısal Dönüşüm
     cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for c in cols:
         if c in df.columns: df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
     
-    # --- YAMA: OTOMATİK SÜTUN OLUŞTURUCU ---
-    # Eğer bu sütunlar yoksa, DataFrame'e ekleriz (Save edince Sheet'te de oluşur)
+    # Otomatik sütun ekleme
     if 'Son_Islem_Tarihi' not in df.columns: df['Son_Islem_Tarihi'] = "-"
     if 'Bot_Son_Kontrol' not in df.columns: df['Bot_Son_Kontrol'] = "-"
     
@@ -62,9 +59,7 @@ def load_portfolio(sheet):
 
 def save_portfolio(df, sheet):
     if sheet:
-        # NaN değerleri temizle
-        df_exp = df.copy().fillna("")
-        df_exp = df_exp.astype(str)
+        df_exp = df.copy().astype(str)
         sheet.clear()
         sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
 
@@ -74,7 +69,7 @@ def log_transaction(sheet, ticker, action, amount, price, model):
         try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
         except: pass
 
-# --- FEATURES ---
+# --- FEATURES & ML ---
 def add_technical_indicators(df):
     df = df.copy()
     delta = df['close'].diff()
@@ -109,11 +104,11 @@ def prepare_features(df):
     df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
+    
     future = df.iloc[[-1]].copy()
     hist = df.iloc[:-1].copy()
     return hist, future
 
-# --- IMPUTATION (Baydo v2) ---
 class ImputationLab:
     def baydo_impute(self, df):
         filled = df.copy()
@@ -141,16 +136,14 @@ class ImputationLab:
                 imp = IterativeImputer(estimator=BayesianRidge(), max_iter=5, random_state=42)
                 X_tr = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
                 X_te = pd.DataFrame(imp.transform(X_te), columns=features, index=X_te.index)
-            except: 
-                X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
+            except: X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
         elif method == 'KNN':
             try:
                 imp = KNNImputer(n_neighbors=5)
                 X_tr = pd.DataFrame(imp.fit_transform(X_tr), columns=features, index=X_tr.index)
                 X_te = pd.DataFrame(imp.transform(X_te), columns=features, index=X_te.index)
-            except:
-                X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
-        else: # Linear
+            except: X_tr = self.baydo_impute(X_tr); X_te = self.baydo_impute(X_te)
+        else:
             X_tr = X_tr.interpolate(method='linear').fillna(0)
             X_te = X_te.interpolate(method='linear').fillna(0)
             
@@ -159,7 +152,6 @@ class ImputationLab:
         X_te_s = pd.DataFrame(scaler.transform(X_te), columns=features, index=X_te.index)
         return X_tr_s, X_te_s, scaler
 
-# --- BRAIN ---
 class GrandLeagueBrain:
     def __init__(self):
         self.lab = ImputationLab()
@@ -200,32 +192,40 @@ class GrandLeagueBrain:
                 if m_xgb:
                     p = (rf.predict_proba(X_val)[:,1]*0.3 + et.predict_proba(X_val)[:,1]*0.3 + m_xgb.predict_proba(X_val)[:,1]*0.4)
                     scores_ens.append(accuracy_score(y_val, (p>0.5).astype(int)))
+            
             avg_x = np.mean(scores_xgb) if scores_xgb else 0
             strategies.append({'name': f"{imp} + XGB", 'type': 'XGB', 'score': avg_x, 'imputer_name': imp})
             avg_e = np.mean(scores_ens) if scores_ens else 0
             strategies.append({'name': f"{imp} + ENS", 'type': 'ENS', 'score': avg_e, 'imputer_name': imp})
         winner = max(strategies, key=lambda x: x['score'])
-        return winner
+        return winner, strategies
 
-# --- EXECUTION LOGIC ---
+# --- EXECUTION LOGIC (BURASI DÜZELTİLDİ) ---
 def analyze_ticker(idx, row, now_str):
     brain = GrandLeagueBrain()
     ticker = row['Ticker']
     res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': ticker}
+    
     try:
         df = get_data(ticker)
         if df is None or len(df) < 200: return res
-        hist, future = prepare_features(df)
-        winner = brain.run_league(hist)
         
+        hist, future = prepare_features(df)
+        winner, _ = brain.run_league(hist) # Tabloya gerek yok
+        
+        # --- KRİTİK EKLEME: GELECEK TAHMİNİ ---
+        # 1. Veri Hazırlığı
         lookback = pd.concat([hist.iloc[-50:], future])
+        
+        # 2. Impute & Scale (Kazanan yönteme göre)
         X_full, X_future_scaled, _ = brain.lab.apply_imputation(hist, future, winner['imputer_name'])
         y_full = hist['target']
         
+        # 3. Model Eğitimi ve Tahmin
         if winner['type'] == 'XGB':
             model = brain.tune_xgboost(X_full, y_full)
             prob = model.predict_proba(X_future_scaled)[:,1][0]
-        else: # ENS
+        else: # Ensemble
             m_xgb = brain.tune_xgboost(X_full, y_full)
             rf = RandomForestClassifier(50, max_depth=5, n_jobs=1).fit(X_full, y_full)
             et = ExtraTreesClassifier(50, max_depth=5, n_jobs=1).fit(X_full, y_full)
@@ -234,6 +234,7 @@ def analyze_ticker(idx, row, now_str):
             p3 = m_xgb.predict_proba(X_future_scaled)[:,1]
             prob = (p1*0.3 + p2*0.3 + p3*0.4)[0]
             
+        # 4. Risk ve Karar
         vol = hist['volatility_measure'].iloc[-1]
         target_vol = 0.04
         if vol==0 or np.isnan(vol): risk_factor = 1.0
@@ -245,6 +246,7 @@ def analyze_ticker(idx, row, now_str):
         
         log_msg = f"{winner['name']} (Acc:{winner['score']:.2f} | P:{prob:.2f} | R:{risk_factor:.2f}x)"
         
+        # 5. Sonuç Paketleme
         res['action'] = decision
         res['log'] = log_msg
         res['price'] = df['close'].iloc[-1]
@@ -259,7 +261,7 @@ def analyze_ticker(idx, row, now_str):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    logger.info("Bot Started V14 (System Check Active).")
+    logger.info("Bot Started V14 (Auto-Trader).")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     if pf.empty: exit()
@@ -269,9 +271,9 @@ if __name__ == "__main__":
     updated['Nakit_Bakiye_USD'] = 0.0
     buys = []
     
-    # --- YAMA: KALP ATIŞI (HEARTBEAT) ---
+    # Kalp Atışı (Botun çalıştığını sheet'e yazar)
     now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
-    updated['Bot_Son_Kontrol'] = now_str # Her çalışmada buraya imza atar
+    updated['Bot_Son_Kontrol'] = now_str 
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(analyze_ticker, idx, row, now_str): idx for idx, row in updated.iterrows()}
