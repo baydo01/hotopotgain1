@@ -1,33 +1,32 @@
-name: Hedge Fund Bot Runner
+name: Crypto Bot Runner
 
 on:
   schedule:
-    # Her saat başı çalıştır (UTC saatine göre)
-    # "0 * * * *" -> Her saatin 0. dakikasında çalış demektir.
-    - cron: '0 * * * *' 
-  workflow_dispatch: # GitHub üzerinden manuel "Run" butonu ekler
+    - cron: '*/15 * * * *'  # Her 15 dakikada bir çalıştır
+  workflow_dispatch:        # Manuel çalıştırma butonu ekle
 
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
-
+    
     steps:
-      - name: Depoyu Çek (Checkout)
+      - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Python Kurulumu
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.9'
 
-      - name: Kütüphaneleri Yükle
+      - name: Install Libraries
         run: |
-          pip install -r requirements.txt
+          pip install yfinance pandas numpy gspread oauth2client scikit-learn hmmlearn xgboost plotly
 
-      - name: Botu Çalıştır
+      - name: Create JSON Key File
         env:
-          # GitHub Secrets'tan verileri alıp koda gönderiyoruz
-          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_JSON: ${{ secrets.GCP_JSON }}
         run: |
-          python bot.py
+          echo "$GCP_JSON" > service_account.json
+
+      - name: Run Trading Bot
+        run: python bot.py
