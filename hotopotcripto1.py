@@ -10,29 +10,27 @@ import os
 
 st.set_page_config(page_title="Hedge Fund AI: V16", layout="wide", page_icon="📡")
 
-# --- CONNECT (AKILLI BAĞLANTI) ---
+# --- CONNECT (HİBRİT) ---
 def connect_sheet_services():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = None
     
-    # 1. DURUM: Streamlit Cloud'dayım (Secrets Kullan)
+    # 1. Cloud Secrets
     if "gcp_service_account" in st.secrets:
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
         except Exception as e:
             st.error(f"Cloud Secrets Hatası: {e}")
 
-    # 2. DURUM: Senin Bilgisayarındayım (Dosya Kullan)
-    # Eğer yukarıdaki çalışmadıysa ve dosya varsa bunu kullan
+    # 2. Yerel Dosya
     if creds is None and os.path.exists("service_account.json"):
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
         except Exception as e:
             st.error(f"Yerel Dosya Hatası: {e}")
 
-    # 3. DURUM: İkisi de Yok (Hata)
     if creds is None:
-        st.error("⚠️ BAĞLANTI YOK! Ne 'Secrets' ne de 'service_account.json' bulundu.")
+        st.error("⚠️ BAĞLANTI YOK! 'service_account.json' dosyası veya Secrets bulunamadı.")
         return None, None, None
     
     try:
@@ -41,17 +39,23 @@ def connect_sheet_services():
         spreadsheet = client.open_by_key(SHEET_ID)
         try: hist = spreadsheet.worksheet("Gecmis")
         except: hist = spreadsheet.add_worksheet("Gecmis", 1000, 6)
+        
+        # DÖNÜŞ: (Portfolio Sayfası, Geçmiş Sayfası, Client)
         return spreadsheet.sheet1, hist, client
     except Exception as e:
         st.error(f"Google Sheets Bağlantı Hatası: {e}")
         return None, None, None
 
 def load_data():
-    pf_sheet, hist_sheet, sheet_obj = connect_sheet_services()
+    # BURASI DÜZELTİLDİ: Değişkenleri doğru sırada alıyoruz
+    pf_sheet, hist_sheet, _ = connect_sheet_services()
+    
     if pf_sheet is None: return pd.DataFrame(), pd.DataFrame(), None
     
     pf_data = pf_sheet.get_all_records()
     df_pf = pd.DataFrame(pf_data)
+    
+    # Sayısal Dönüşüm
     cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for c in cols:
         if c in df_pf.columns: df_pf[c] = pd.to_numeric(df_pf[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
@@ -61,7 +65,8 @@ def load_data():
         df_hist = pd.DataFrame(hist_data)
     except: df_hist = pd.DataFrame()
     
-    return df_pf, df_hist, sheet_obj
+    # KRİTİK DÜZELTME: update işlemini yapacak olan 'pf_sheet' nesnesini döndürüyoruz
+    return df_pf, df_hist, pf_sheet 
 
 # --- UI LOGIC ---
 df_pf, df_hist, sheet_obj = load_data()
@@ -71,6 +76,8 @@ st.title("📡 Hedge Fund AI: V16 Live Monitor")
 if not df_pf.empty:
     # TOP METRICS
     total_val = df_pf['Nakit_Bakiye_USD'].sum() + df_pf[df_pf['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
+    
+    # Sütun kontrolü (Hata almamak için)
     last_update = df_pf['Bot_Son_Kontrol'].iloc[0] if 'Bot_Son_Kontrol' in df_pf.columns else "N/A"
     status = df_pf['Bot_Durum'].iloc[0] if 'Bot_Durum' in df_pf.columns else "Bilinmiyor"
 
@@ -89,22 +96,35 @@ if not df_pf.empty:
     if c4.button("🚨 ŞİMDİ ÇALIŞTIR"):
         if sheet_obj:
             df_pf['Bot_Trigger'] = "TRUE"
-            sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
-            st.toast("Sinyal gönderildi! Bot bekleniyor...")
-            time.sleep(2)
-            st.rerun()
+            # Güncelleme satırı (Artık doğru nesneyi kullanıyor)
+            try:
+                sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
+                st.toast("Sinyal gönderildi! Bot bekleniyor...")
+                time.sleep(2)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Güncelleme Hatası: {e}")
         else:
-            st.error("Sheet bağlantısı yok.")
+            st.error("Sheet bağlantısı kopuk.")
 
     # --- TABS ---
     t1, t2 = st.tabs(["📊 Portföy", "📜 Geçmiş"])
 
     with t1:
         st.dataframe(df_pf, use_container_width=True)
-        chart_data = df_pf.copy()
-        chart_data['Değer'] = np.where(chart_data['Durum']=='COIN', chart_data['Kaydedilen_Deger_USD'], chart_data['Nakit_Bakiye_USD'])
-        fig = px.pie(chart_data, values='Değer', names='Ticker', title="Portföy Dağılımı", hole=0.4)
-        st.plotly_chart(fig)
+        # Grafik
+        if not df_pf.empty:
+            chart_data = df_pf.copy()
+            # Basit bir değer hesaplaması (Coin değeri + Nakit)
+            chart_data['Değer'] = np.where(chart_data['Durum']=='COIN', chart_data['Kaydedilen_Deger_USD'], chart_data['Nakit_Bakiye_USD'])
+            # Sadece değeri 0'dan büyük olanları göster
+            chart_data = chart_data[chart_data['Değer'] > 0]
+            
+            if not chart_data.empty:
+                fig = px.pie(chart_data, values='Değer', names='Ticker', title="Varlık Dağılımı", hole=0.4)
+                st.plotly_chart(fig)
+            else:
+                st.info("Gösterilecek varlık verisi yok (Tüm bakiyeler 0).")
 
     with t2:
         if not df_hist.empty:
@@ -112,8 +132,9 @@ if not df_pf.empty:
         else:
             st.write("İşlem geçmişi yok.")
 
+    # Auto-Refresh
     if "İşleniyor" in status:
         time.sleep(10)
         st.rerun()
 else:
-    st.warning("Veri yüklenemedi. Lütfen bağlantı ayarlarını kontrol edin.")
+    st.warning("Veri yüklenemedi. Bağlantı ayarlarını kontrol et.")
