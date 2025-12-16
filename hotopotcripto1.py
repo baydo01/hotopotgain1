@@ -1,251 +1,199 @@
 import streamlit as st
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
-import yfinance as yf
 import numpy as np
-import xgboost as xgb
-from sklearn.linear_model import LinearRegression
+import gspread
+import plotly.express as px
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 import time
+import os
+import yfinance as yf
 
-# ==========================================
-# 1. AYARLAR VE BAĞLANTILAR (BACKEND)
-# ==========================================
+st.set_page_config(page_title="Hedge Fund AI: V18", layout="wide", page_icon="📡")
 
-# Google Sheets Bağlantısı (Cache kullanarak hızlandırıyoruz)
-@st.cache_resource
-def get_google_sheet_client():
+# --- CONNECT (HİBRİT) ---
+def connect_sheet_services():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    # 'credentials.json' dosyanızın projenin ana dizininde olduğundan emin olun
-    creds = ServiceAccountCredentials.from_json_keyfile_name("sizin_api_json_dosyaniz.json", scope)
-    client = gspread.authorize(creds)
-    return client
+    creds = None
+    
+    # 1. Cloud Secrets
+    if "gcp_service_account" in st.secrets:
+        try:
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
+        except Exception as e:
+            st.error(f"Cloud Secrets Hatası: {e}")
 
-def get_data_from_sheet():
-    client = get_google_sheet_client()
+    # 2. Yerel Dosya
+    if creds is None and os.path.exists("service_account.json"):
+        try:
+            creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+        except Exception as e:
+            st.error(f"Yerel Dosya Hatası: {e}")
+
+    if creds is None:
+        st.error("⚠️ BAĞLANTI YOK! 'service_account.json' dosyası veya Secrets bulunamadı.")
+        return None, None, None
+    
     try:
-        sheet = client.open("Sizin_Tablo_Adiniz").sheet1  # Tablo adını buraya girin
-        data = sheet.get_all_records()
-        df = pd.DataFrame(data)
-        return sheet, df
+        client = gspread.authorize(creds)
+        SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
+        spreadsheet = client.open_by_key(SHEET_ID)
+        try: hist = spreadsheet.worksheet("Gecmis")
+        except: hist = spreadsheet.add_worksheet("Gecmis", 1000, 6)
+        
+        # DÖNÜŞ: (Portfolio Sayfası, Geçmiş Sayfası, Client)
+        return spreadsheet.sheet1, hist, client
     except Exception as e:
         st.error(f"Google Sheets Bağlantı Hatası: {e}")
-        return None, None
+        return None, None, None
 
-# ==========================================
-# 2. VOLATİLİTE HESAPLAMA MOTORU
-# ==========================================
+def load_data():
+    pf_sheet, hist_sheet, _ = connect_sheet_services()
+    
+    if pf_sheet is None: return pd.DataFrame(), pd.DataFrame(), None
+    
+    pf_data = pf_sheet.get_all_records()
+    df_pf = pd.DataFrame(pf_data)
+    
+    # Sayısal Dönüşüm
+    cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", "Volatilite"]
+    for c in cols:
+        if c in df_pf.columns: df_pf[c] = pd.to_numeric(df_pf[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+    
+    if 'Volatilite' not in df_pf.columns: df_pf['Volatilite'] = 0.0
 
-def calculate_volatility(ticker, window=20):
-    """
-    yfinance kullanarak son 'window' günün volatilitesini çeker.
-    Ticker formatı 'BTC-USD' gibi olmalıdır.
-    """
     try:
-        # Eğer 'COIN' veya 'CASH' gibi ticker olmayan satırlar varsa onları atla
-        if "USD" not in ticker and len(ticker) < 6: 
-            return 0.0
-            
-        stock = yf.Ticker(ticker)
-        # 3 aylık veri çekiyoruz ki hareketli ortalama hesaplanabilsin
-        hist = stock.history(period="3mo")
-        
-        if len(hist) < window:
-            return 0.0
-        
-        # Log Return Hesaplama
-        hist['Log_Return'] = np.log(hist['Close'] / hist['Close'].shift(1))
-        
-        # Standart Sapma (Volatilite)
-        vol = hist['Log_Return'].rolling(window=window).std().iloc[-1]
-        
-        # NaN kontrolü
-        if pd.isna(vol):
-            return 0.0
-            
-        return float(vol)
-    except Exception as e:
-        # st.warning(f"{ticker} için veri çekilemedi: {e}")
-        return 0.0
+        hist_data = hist_sheet.get_all_records()
+        df_hist = pd.DataFrame(hist_data)
+    except: df_hist = pd.DataFrame()
+    
+    return df_pf, df_hist, pf_sheet 
 
-def update_volatility_column(sheet, df):
+# --- VOLATİLİTE HESAPLAMA (YENİ FONKSİYON) ---
+def calculate_and_update_volatility(sheet, df):
     """
-    DataFrame'deki her satır için volatiliteyi hesaplar ve Sheets'e yazar.
+    Tüm tickerlar için 1 aylık volatiliteyi hesaplar ve Sheets'e yazar.
     """
+    status_bar = st.progress(0)
     status_text = st.empty()
-    progress_bar = st.progress(0)
     
-    volatilities = []
+    new_vols = []
+    tickers = df['Ticker'].tolist()
     
-    total_rows = len(df)
-    for i, row in df.iterrows():
-        ticker = row['Ticker']
-        status_text.text(f"Volatilite Hesaplanıyor: {ticker}...")
+    for i, ticker in enumerate(tickers):
+        status_text.text(f"Analiz ediliyor: {ticker}...")
+        try:
+            if "USD" not in ticker and len(ticker) < 6:
+                new_vols.append(0.0)
+                continue
+                
+            # Son 2 ayın verisini çekip 20 günlük volatiliteye bakıyoruz
+            hist = yf.download(ticker, period="2mo", progress=False)
+            if len(hist) > 20:
+                # Log Return
+                hist['Log_Ret'] = np.log(hist['Close'] / hist['Close'].shift(1))
+                # Volatilite (Standart Sapma)
+                vol = hist['Log_Ret'].rolling(window=20).std().iloc[-1]
+                new_vols.append(float(vol) if not pd.isna(vol) else 0.0)
+            else:
+                new_vols.append(0.0)
+        except Exception as e:
+            new_vols.append(0.0)
         
-        vol = calculate_volatility(ticker)
-        volatilities.append(vol)
+        status_bar.progress((i + 1) / len(tickers))
         
-        # İlerleme çubuğu güncelle
-        progress_bar.progress((i + 1) / total_rows)
+    df['Volatilite'] = new_vols
     
-    # DataFrame'e ekle
-    df['Volatilite'] = volatilities
-    
-    # Google Sheets'e Yazma
-    # Eğer 'Volatilite' sütunu yoksa, sheet'te en sağa ekleriz.
+    # Sheets'e Yazma
     try:
-        cell = sheet.find("Volatilite")
-        col_idx = cell.col
-    except:
-        col_idx = len(df.columns) # Yeni sütun indeksi (df'e zaten ekledik)
-        sheet.update_cell(1, col_idx, "Volatilite")
-    
-    # Sütunu toplu güncelle (API kotası dostu)
-    cell_list = []
-    for i, vol in enumerate(volatilities):
-        # Satır 2'den başlar (1 başlık)
-        cell_list.append(gspread.Cell(row=i+2, col=col_idx, value=vol))
-    
-    sheet.update_cells(cell_list)
-    status_text.text("✅ Volatilite değerleri Sheets'e başarıyla işlendi!")
-    time.sleep(1)
+        # Eğer Volatilite sütunu yoksa oluşturulmasını garanti edelim ama update ile tüm tabloyu yazmak daha güvenli
+        sheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
+        st.success("✅ Volatilite değerleri Sheets'e işlendi!")
+    except Exception as e:
+        st.error(f"Sheets Güncelleme Hatası: {e}")
+        
     status_text.empty()
-    progress_bar.empty()
-    
+    status_bar.empty()
     return df
 
-# ==========================================
-# 3. HİBRİT MODEL (LINEAR + XGBOOST)
-# ==========================================
+# --- UI LOGIC ---
+df_pf, df_hist, sheet_obj = load_data()
 
-def run_hybrid_model(df):
-    """
-    Volatiliteyi de feature olarak alıp analiz yapar.
-    Not: Gerçek bir proje için eğitilmiş model (.model dosyası) yüklenmelidir.
-    Burada mantığı simüle ediyoruz.
-    """
-    signals = []
+st.title("📡 Hedge Fund AI: V18 Live Monitor")
+
+if not df_pf.empty:
+    # TOP METRICS
+    total_val = df_pf['Nakit_Bakiye_USD'].sum() + df_pf[df_pf['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
     
-    # Modelin kullanacağı sütunlar (Örnektir, elinizdeki veriye göre artırın)
-    # Burada 'Son_Islem_Fiyati' gibi değerleri feature olarak kullanıyoruz basitçe.
-    # Gerçekte RSI, MACD gibi indikatörler de hesaplanıp buraya eklenmeli.
-    
-    for i, row in df.iterrows():
-        ticker = row['Ticker']
-        volatilite = float(row.get('Volatilite', 0))
-        fiyat = float(row.get('Son_Islem_Fiyati', 0))
-        bakiye = float(row.get('Nakit_Bakiye_USD', 0))
+    last_update = df_pf['Bot_Son_Kontrol'].iloc[0] if 'Bot_Son_Kontrol' in df_pf.columns else "N/A"
+    status = df_pf['Bot_Durum'].iloc[0] if 'Bot_Durum' in df_pf.columns else "Bilinmiyor"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Toplam Varlık", f"${total_val:.2f}")
+    c2.metric("Son Güncelleme", str(last_update).split(' ')[1] if ' ' in str(last_update) else str(last_update))
+
+    if "İşleniyor" in status:
+        c3.warning(f"⚙️ {status}")
+    elif "Hazır" in status or "Bitti" in status:
+        c3.success(f"🟢 {status}")
+    else:
+        c3.info(f"ℹ️ {status}")
+
+    # MANUEL TETİKLEME ALANI
+    with c4:
+        st.write("Kontrol Paneli")
+        if st.button("📊 1. Volatiliteyi Güncelle"):
+            if sheet_obj:
+                df_pf = calculate_and_update_volatility(sheet_obj, df_pf)
+                st.rerun()
+            else:
+                st.error("Sheet bağlantısı yok.")
+                
+        if st.button("🚨 2. BOTU ÇALIŞTIR"):
+            if sheet_obj:
+                df_pf['Bot_Trigger'] = "TRUE"
+                try:
+                    sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
+                    st.toast("Sinyal gönderildi! Bot bekleniyor...")
+                    time.sleep(2)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Güncelleme Hatası: {e}")
+            else:
+                st.error("Sheet bağlantısı kopuk.")
+
+    # --- TABS ---
+    t1, t2 = st.tabs(["📊 Portföy & Risk", "📜 Geçmiş"])
+
+    with t1:
+        # Volatiliteyi renklendirerek gösterelim
+        st.dataframe(df_pf.style.background_gradient(subset=['Volatilite'], cmap='Reds'), use_container_width=True)
         
-        # --- MODEL SİMÜLASYONU ---
-        
-        # 1. Linear Model Skoru (Basit Trend)
-        # Volatilite düşükse Linear modele daha çok güven
-        linear_score = 0.6 if fiyat > 0 else 0 # Temsili
-        
-        # 2. XGBoost Skoru (Karmaşık Yapı)
-        # Volatilite yüksekse XGBoost'un yakaladığı patternlere güven
-        xgb_score = 0.75 # Temsili tahmin
-        
-        # 3. Ağırlıklandırma (Dinamik)
-        if volatilite > 0.04: # Yüksek oynaklık
-            weight_linear = 0.2
-            weight_xgb = 0.8
-            note = "High Vol"
-        else: # Düşük oynaklık
-            weight_linear = 0.6
-            weight_xgb = 0.4
-            note = "Stable"
+        if not df_pf.empty:
+            c_chart1, c_chart2 = st.columns(2)
+            with c_chart1:
+                chart_data = df_pf.copy()
+                chart_data['Değer'] = np.where(chart_data['Durum']=='COIN', chart_data['Kaydedilen_Deger_USD'], chart_data['Nakit_Bakiye_USD'])
+                chart_data = chart_data[chart_data['Değer'] > 0]
+                if not chart_data.empty:
+                    fig = px.pie(chart_data, values='Değer', names='Ticker', title="Varlık Dağılımı", hole=0.4)
+                    st.plotly_chart(fig, use_container_width=True)
             
-        final_score = (linear_score * weight_linear) + (xgb_score * weight_xgb)
-        
-        # Karar Mekanizması
-        # CASH satırları için işlem yapma
-        if "CASH" in str(ticker) or "USDT" in str(ticker):
-            signal = "BEKLE"
-        elif final_score > 0.65:
-            signal = f"AL Linear+XGB ({note} P:{final_score:.2f})"
-        elif final_score < 0.35:
-            signal = f"SAT Linear+XGB ({note} P:{final_score:.2f})"
+            with c_chart2:
+                # Volatilite Bar Chart 
+                if 'Volatilite' in df_pf.columns:
+                    fig_vol = px.bar(df_pf[df_pf['Volatilite']>0], x='Ticker', y='Volatilite', title="Risk (Volatilite) Analizi", color='Volatilite')
+                    st.plotly_chart(fig_vol, use_container_width=True)
+
+    with t2:
+        if not df_hist.empty:
+            st.dataframe(df_hist.iloc[::-1], use_container_width=True)
         else:
-            signal = "TUT"
-            
-        signals.append(signal)
-        
-    return signals
+            st.write("İşlem geçmişi yok.")
 
-def update_bot_status(sheet, df, signals):
-    """
-    Model sonuçlarını 'Bot_Durum' sütununa yazar.
-    """
-    df['Bot_Durum'] = signals
-    
-    try:
-        cell = sheet.find("Bot_Durum")
-        col_idx = cell.col
-    except:
-        st.error("'Bot_Durum' sütunu bulunamadı, lütfen Sheet'e ekleyin.")
-        return df
-
-    cell_list = []
-    for i, sig in enumerate(signals):
-        cell_list.append(gspread.Cell(row=i+2, col=col_idx, value=sig))
-        
-    sheet.update_cells(cell_list)
-    return df
-
-# ==========================================
-# 4. STREAMLIT ARAYÜZÜ (FRONTEND)
-# ==========================================
-
-st.set_page_config(page_title="AI Trading Bot Manager", layout="wide")
-
-st.title("🤖 AI Trading Bot & Volatilite Analizörü")
-st.markdown("---")
-
-# Yan Menü
-st.sidebar.header("Kontrol Paneli")
-run_btn = st.sidebar.button("🚀 Analizi Başlat (Update & Predict)", type="primary")
-
-# Ana Akış
-sheet, df = get_data_from_sheet()
-
-if sheet is not None:
-    # İlk yüklemede tabloyu göster
-    st.subheader("📊 Mevcut Portföy Durumu")
-    st.dataframe(df)
-
-    if run_btn:
-        with st.spinner('Sistem çalışıyor... Lütfen bekleyiniz.'):
-            
-            # ADIM 1: Volatilite Hesapla ve Sheets'i Güncelle
-            st.info("Adım 1/3: Volatilite verileri yfinance üzerinden çekiliyor...")
-            df_updated = update_volatility_column(sheet, df)
-            
-            # ADIM 2: Modeli Çalıştır (Feature olarak Volatilite kullanır)
-            st.info("Adım 2/3: Hibrit Model (Linear + XGB) tahmin üretiyor...")
-            signals = run_hybrid_model(df_updated)
-            
-            # ADIM 3: Sonuçları Sheets'e Yaz
-            st.info("Adım 3/3: Kararlar Google Sheets'e işleniyor...")
-            df_final = update_bot_status(sheet, df_updated, signals)
-            
-            st.success("İşlem Tamamlandı! Tablo güncellendi.")
-            
-            # Güncel tabloyu tekrar göster
-            st.subheader("✅ Güncellenmiş Analiz Sonuçları")
-            
-            # Renklendirme fonksiyonu
-            def color_bot_durum(val):
-                color = 'white'
-                if 'AL' in str(val): color = '#28a745' # Yeşil
-                elif 'SAT' in str(val): color = '#dc3545' # Kırmızı
-                return f'background-color: {color}'
-
-            st.dataframe(df_final.style.applymap(color_bot_durum, subset=['Bot_Durum']))
-            
-            # İstatistikler
-            avg_vol = df_final[df_final['Volatilite'] > 0]['Volatilite'].mean()
-            st.metric(label="Ortalama Piyasa Volatilitesi", value=f"{avg_vol:.4f}")
-
+    # Auto-Refresh
+    if "İşleniyor" in status:
+        time.sleep(10)
+        st.rerun()
 else:
-    st.warning("Veri çekilemedi. Lütfen JSON dosyasını ve bağlantıyı kontrol edin.")
+    st.warning("Veri yüklenemedi. Bağlantı ayarlarını kontrol et.")
