@@ -1,140 +1,246 @@
-import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
+import warnings
 import gspread
-import plotly.express as px
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+import logging
 import time
 import os
+import sys
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="Hedge Fund AI: V16", layout="wide", page_icon="📡")
+# --- ML LIBRARIES ---
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer, KNNImputer
+from sklearn.linear_model import BayesianRidge, LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import accuracy_score
+import xgboost as xgb
 
-# --- CONNECT (HİBRİT) ---
-def connect_sheet_services():
+warnings.filterwarnings("ignore")
+
+# CONFIG
+SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
+CREDENTIALS_FILE = "service_account.json"
+DATA_PERIOD = "730d"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', stream=sys.stdout)
+logger = logging.getLogger()
+
+# --- CONNECT ---
+def connect_services():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = None
-    
-    # 1. Cloud Secrets
-    if "gcp_service_account" in st.secrets:
-        try:
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
-        except Exception as e:
-            st.error(f"Cloud Secrets Hatası: {e}")
-
-    # 2. Yerel Dosya
-    if creds is None and os.path.exists("service_account.json"):
-        try:
-            creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
-        except Exception as e:
-            st.error(f"Yerel Dosya Hatası: {e}")
-
-    if creds is None:
-        st.error("⚠️ BAĞLANTI YOK! 'service_account.json' dosyası veya Secrets bulunamadı.")
-        return None, None, None
-    
+    if not os.path.exists(CREDENTIALS_FILE):
+        logger.error(f"KRİTİK HATA: {CREDENTIALS_FILE} yok! Secrets ayarını kontrol et.")
+        sys.exit(1)
     try:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         client = gspread.authorize(creds)
-        SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
         spreadsheet = client.open_by_key(SHEET_ID)
         try: hist = spreadsheet.worksheet("Gecmis")
         except: hist = spreadsheet.add_worksheet("Gecmis", 1000, 6)
-        
-        # DÖNÜŞ: (Portfolio Sayfası, Geçmiş Sayfası, Client)
-        return spreadsheet.sheet1, hist, client
+        logger.info("✅ Google Sheets Bağlantısı BAŞARILI.")
+        return spreadsheet.sheet1, hist
     except Exception as e:
-        st.error(f"Google Sheets Bağlantı Hatası: {e}")
-        return None, None, None
+        logger.error(f"Bağlantı Hatası: {e}")
+        sys.exit(1)
 
-def load_data():
-    # BURASI DÜZELTİLDİ: Değişkenleri doğru sırada alıyoruz
-    pf_sheet, hist_sheet, _ = connect_sheet_services()
-    
-    if pf_sheet is None: return pd.DataFrame(), pd.DataFrame(), None
-    
-    pf_data = pf_sheet.get_all_records()
-    df_pf = pd.DataFrame(pf_data)
-    
-    # Sayısal Dönüşüm
+def load_portfolio(sheet):
+    data = sheet.get_all_records()
+    if not data: return pd.DataFrame()
+    df = pd.DataFrame(data)
     cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for c in cols:
-        if c in df_pf.columns: df_pf[c] = pd.to_numeric(df_pf[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+        if c in df.columns: df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+    if 'Son_Islem_Tarihi' not in df.columns: df['Son_Islem_Tarihi'] = "-"
+    if 'Bot_Son_Kontrol' not in df.columns: df['Bot_Son_Kontrol'] = "-"
+    if 'Bot_Trigger' not in df.columns: df['Bot_Trigger'] = "FALSE"
+    if 'Bot_Durum' not in df.columns: df['Bot_Durum'] = "Beklemede"
+    return df
+
+def save_portfolio(df, sheet):
+    if sheet:
+        try:
+            df_exp = df.copy().astype(str)
+            sheet.clear()
+            sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
+            logger.info("💾 Veriler Sheets'e kaydedildi.")
+        except Exception as e: logger.error(f"Kaydetme Hatası: {e}")
+
+def log_transaction(sheet, ticker, action, amount, price, model):
+    if sheet:
+        now = datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M')
+        try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
+        except: pass
+
+# --- ML & FEATURES (DÜZELTİLDİ) ---
+def get_data(ticker):
+    try:
+        # DÜZELTME: Veri çekme ve sütun temizleme işlemi sağlamlaştırıldı
+        df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
+        if df.empty: return None
+        
+        # MultiIndex kontrolü (yfinance yeni sürümleri için)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # Sütunları küçük harfe çevir (Close -> close)
+        df.columns = [c.lower() for c in df.columns]
+        return df
+    except: return None
+
+def prepare_features(df):
+    df = df.copy().replace([np.inf, -np.inf], np.nan)
+    # Hata kontrolü: Gerekli sütunlar var mı?
+    if 'close' not in df.columns: return None, None
+    
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    df['rsi'] = 100 - (100 / (1 + gain/loss))
+    df['atr'] = (df['high']-df['low']).rolling(14).mean()
+    df['sma_20'] = df['close'].rolling(20).mean()
+    df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
+    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+    df['range'] = (df['high'] - df['low']) / df['close']
+    df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
+    df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+    df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
+    
+    if len(df) < 50: return None, None # Yetersiz veri
+    
+    return df.iloc[:-1].copy(), df.iloc[[-1]].copy()
+
+class ImputationLab:
+    def apply_imputation(self, df_tr, df_te, method):
+        features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
+        X_tr = df_tr[features].copy(); X_te = df_te[features].copy()
+        X_tr.interpolate(limit_direction='both', inplace=True)
+        X_te.interpolate(limit_direction='both', inplace=True)
+        X_tr.fillna(method='bfill', inplace=True); X_tr.fillna(method='ffill', inplace=True)
+        X_te.fillna(method='bfill', inplace=True); X_te.fillna(method='ffill', inplace=True)
+        scaler = RobustScaler()
+        return pd.DataFrame(scaler.fit_transform(X_tr), columns=features, index=X_tr.index), \
+               pd.DataFrame(scaler.transform(X_te), columns=features, index=X_te.index)
+
+class GrandLeagueBrain:
+    def __init__(self): self.lab = ImputationLab()
+    def tune_xgboost(self, X_tr, y_tr):
+        m = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, n_jobs=1, random_state=42)
+        m.fit(X_tr, y_tr)
+        return m
+    def run_league(self, df):
+        imp = 'Linear'
+        split = int(len(df)*0.85)
+        df_tr = df.iloc[:split]; df_val = df.iloc[split:]
+        X_tr, X_val = self.lab.apply_imputation(df_tr, df_val, imp)
+        m_xgb = self.tune_xgboost(X_tr, df_tr['target'])
+        return {'name': f"{imp}+XGB", 'type': 'XGB', 'score': accuracy_score(df_val['target'], m_xgb.predict(X_val)), 'imputer': imp}
+
+def analyze_ticker(idx, row):
+    brain = GrandLeagueBrain()
+    # DÜZELTME: Varsayılan değer olarak 'log' eklendi (Hata olursa çökmemesi için)
+    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': row['Ticker'], 'log': 'Veri/Islem Hatasi'}
     
     try:
-        hist_data = hist_sheet.get_all_records()
-        df_hist = pd.DataFrame(hist_data)
-    except: df_hist = pd.DataFrame()
-    
-    # KRİTİK DÜZELTME: update işlemini yapacak olan 'pf_sheet' nesnesini döndürüyoruz
-    return df_pf, df_hist, pf_sheet 
-
-# --- UI LOGIC ---
-df_pf, df_hist, sheet_obj = load_data()
-
-st.title("📡 Hedge Fund AI: V16 Live Monitor")
-
-if not df_pf.empty:
-    # TOP METRICS
-    total_val = df_pf['Nakit_Bakiye_USD'].sum() + df_pf[df_pf['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
-    
-    # Sütun kontrolü (Hata almamak için)
-    last_update = df_pf['Bot_Son_Kontrol'].iloc[0] if 'Bot_Son_Kontrol' in df_pf.columns else "N/A"
-    status = df_pf['Bot_Durum'].iloc[0] if 'Bot_Durum' in df_pf.columns else "Bilinmiyor"
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Toplam Varlık", f"${total_val:.2f}")
-    c2.metric("Son Güncelleme", str(last_update).split(' ')[1] if ' ' in str(last_update) else str(last_update))
-
-    if "İşleniyor" in status:
-        c3.warning(f"⚙️ {status}")
-    elif "Hazır" in status:
-        c3.success(f"🟢 {status}")
-    else:
-        c3.info(f"ℹ️ {status}")
-
-    # MANUEL TETİKLEME
-    if c4.button("🚨 ŞİMDİ ÇALIŞTIR"):
-        if sheet_obj:
-            df_pf['Bot_Trigger'] = "TRUE"
-            # Güncelleme satırı (Artık doğru nesneyi kullanıyor)
-            try:
-                sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
-                st.toast("Sinyal gönderildi! Bot bekleniyor...")
-                time.sleep(2)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Güncelleme Hatası: {e}")
-        else:
-            st.error("Sheet bağlantısı kopuk.")
-
-    # --- TABS ---
-    t1, t2 = st.tabs(["📊 Portföy", "📜 Geçmiş"])
-
-    with t1:
-        st.dataframe(df_pf, use_container_width=True)
-        # Grafik
-        if not df_pf.empty:
-            chart_data = df_pf.copy()
-            # Basit bir değer hesaplaması (Coin değeri + Nakit)
-            chart_data['Değer'] = np.where(chart_data['Durum']=='COIN', chart_data['Kaydedilen_Deger_USD'], chart_data['Nakit_Bakiye_USD'])
-            # Sadece değeri 0'dan büyük olanları göster
-            chart_data = chart_data[chart_data['Değer'] > 0]
+        df = get_data(row['Ticker'])
+        if df is None or len(df) < 200: 
+            res['log'] = 'Yetersiz/Bozuk Veri'
+            return res
             
-            if not chart_data.empty:
-                fig = px.pie(chart_data, values='Değer', names='Ticker', title="Varlık Dağılımı", hole=0.4)
-                st.plotly_chart(fig)
-            else:
-                st.info("Gösterilecek varlık verisi yok (Tüm bakiyeler 0).")
+        hist, future = prepare_features(df)
+        if hist is None:
+            res['log'] = 'Feature Hatasi'
+            return res
+            
+        winner = brain.run_league(hist)
+        last_win = pd.concat([hist.iloc[-30:], future])
+        X_full, X_fut_sc = brain.lab.apply_imputation(hist, future, winner['imputer'])
+        model = brain.tune_xgboost(X_full, hist['target'])
+        prob = model.predict_proba(X_fut_sc)[:,1][0]
+        
+        vol = hist['volatility_measure'].iloc[-1]
+        risk = np.clip(0.04/vol, 0.3, 2.0) if vol > 0 else 1.0
+        
+        decision = "HOLD"
+        if prob > 0.58: decision = "BUY"
+        elif prob < 0.42: decision = "SELL"
+        
+        log = f"{winner['name']} (P:{prob:.2f}|R:{risk:.2f}x)"
+        res.update({'action': decision, 'log': log, 'price': df['close'].iloc[-1]})
+        
+        if row['Durum']=='COIN' and decision=="SELL":
+            res['val'] = float(row['Miktar']) * res['price']
+        elif row['Durum']=='CASH' and decision=="BUY":
+            res['buy'] = {'idx':idx, 'ticker':row['Ticker'], 'p':res['price'], 'w': prob*risk, 'm':log}
+            
+    except Exception as e: 
+        logger.error(f"Err {row['Ticker']}: {e}")
+        res['log'] = f"Hata: {str(e)[:20]}" # Hatayı kısa log olarak ekle
+        
+    return res
 
-    with t2:
-        if not df_hist.empty:
-            st.dataframe(df_hist.iloc[::-1], use_container_width=True)
-        else:
-            st.write("İşlem geçmişi yok.")
+if __name__ == "__main__":
+    logger.info("🚀 CLOUD BOT BAŞLATILIYOR (V17.2 Stable)...")
+    pf_sheet, hist_sheet = connect_services()
+    pf = load_portfolio(pf_sheet)
+    if pf.empty: sys.exit(1)
+    
+    # 1. DURUM
+    now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
+    pf['Bot_Durum'] = "☁️ Cloud İşliyor..."
+    pf['Bot_Trigger'] = "FALSE"
+    pf['Bot_Son_Kontrol'] = now_str
+    save_portfolio(pf, pf_sheet)
+    
+    # 2. İŞLEM
+    logger.info("Analiz başlıyor...")
+    updated = pf.copy()
+    cash = updated['Nakit_Bakiye_USD'].sum()
+    updated['Nakit_Bakiye_USD'] = 0.0
+    buys = []
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(analyze_ticker, idx, row): idx for idx, row in updated.iterrows()}
+        for i, future in enumerate(as_completed(futures)):
+            r = future.result()
+            idx = r['idx']
+            # DÜZELTME: r['log'] artık kesinlikle var, KeyError vermez
+            logger.info(f"Analiz: {r['ticker']} -> {r['action']} ({r['log']})")
+            
+            if r['action'] == 'SELL':
+                cash += r['val']
+                updated.at[idx,'Durum']='CASH'; updated.at[idx,'Miktar']=0.0
+                updated.at[idx,'Son_Islem_Log'] = f"SAT {r['log']}"
+                updated.at[idx,'Son_Islem_Tarihi'] = now_str
+                log_transaction(hist_sheet, r['ticker'], "SAT", updated.at[idx,'Miktar'], r['price'], r['log'])
+            elif r['buy']: buys.append(r['buy'])
 
-    # Auto-Refresh
-    if "İşleniyor" in status:
-        time.sleep(10)
-        st.rerun()
-else:
-    st.warning("Veri yüklenemedi. Bağlantı ayarlarını kontrol et.")
+    # 3. ALIMLAR
+    if buys and cash > 2.0:
+        total_w = sum([b['w'] for b in buys])
+        for b in buys:
+            amt = ((b['w']/total_w)*cash) / b['p']
+            updated.at[b['idx'],'Durum']='COIN'; updated.at[b['idx'],'Miktar']=amt
+            updated.at[b['idx'],'Nakit_Bakiye_USD']=0.0; updated.at[b['idx'],'Son_Islem_Log']=f"AL {b['m']}"
+            updated.at[b['idx'],'Son_Islem_Tarihi']=now_str
+            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['m'])
+            logger.info(f"✅ ALIM YAPILDI: {b['ticker']}")
+    elif cash > 0: 
+        updated.at[updated.index[0], 'Nakit_Bakiye_USD'] += cash
+    
+    # 4. BİTİŞ
+    for idx, row in updated.iterrows():
+        if row['Durum'] == 'COIN':
+            try:
+                p = yf.download(row['Ticker'], period="1d", progress=False)['Close'].iloc[-1]
+                updated.at[idx, 'Kaydedilen_Deger_USD'] = float(row['Miktar']) * float(p)
+            except: pass
+        else: updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
+    
+    updated['Bot_Durum'] = "✅ Cloud Bitti"
+    save_portfolio(updated, pf_sheet)
+    logger.info("🏁 İŞLEM TAMAM.")
