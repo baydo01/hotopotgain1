@@ -1,246 +1,267 @@
-import yfinance as yf
+import streamlit as st
 import pandas as pd
 import numpy as np
-import warnings
 import gspread
-import logging
+import plotly.express as px
+import plotly.graph_objects as go
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime, timedelta
 import time
 import os
-import sys
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-import pytz
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import yfinance as yf
+from scipy.stats import norm # İstatistiksel PD hesabı için
 
-# --- ML LIBRARIES ---
-from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer, KNNImputer
-from sklearn.linear_model import BayesianRidge, LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+# --- SCIENTIFIC LIBS ---
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import accuracy_score
+from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 
-warnings.filterwarnings("ignore")
+st.set_page_config(page_title="Model Audit & Risk Dashboard", layout="wide", page_icon="🏦")
 
-# CONFIG
-SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
-CREDENTIALS_FILE = "service_account.json"
-DATA_PERIOD = "730d"
+# --- STYLING (BANKACI MODU) ---
+st.markdown("""
+<style>
+    .metric-card {background-color: #1e2130; padding: 15px; border-radius: 10px; border-left: 5px solid #4caf50;}
+    .risk-card {background-color: #262730; padding: 10px; border-radius: 5px; border-left: 4px solid #d32f2f;}
+    .audit-header {font-size: 24px; font-weight: bold; color: #ffffff; border-bottom: 2px solid #555; padding-bottom: 10px;}
+    .stDataFrame {font-size: 12px;}
+</style>
+""", unsafe_allow_html=True)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', stream=sys.stdout)
-logger = logging.getLogger()
-
-# --- CONNECT ---
-def connect_services():
+# --- 1. DATA CONNECTION ---
+def connect_sheet_services():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    if not os.path.exists(CREDENTIALS_FILE):
-        logger.error(f"KRİTİK HATA: {CREDENTIALS_FILE} yok! Secrets ayarını kontrol et.")
-        sys.exit(1)
+    creds = None
+    if "gcp_service_account" in st.secrets:
+        try: creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
+        except: pass
+    if creds is None and os.path.exists("service_account.json"):
+        try: creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+        except: pass
+    if creds is None: return None, None, None
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
         client = gspread.authorize(creds)
+        SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
         spreadsheet = client.open_by_key(SHEET_ID)
         try: hist = spreadsheet.worksheet("Gecmis")
         except: hist = spreadsheet.add_worksheet("Gecmis", 1000, 6)
-        logger.info("✅ Google Sheets Bağlantısı BAŞARILI.")
-        return spreadsheet.sheet1, hist
-    except Exception as e:
-        logger.error(f"Bağlantı Hatası: {e}")
-        sys.exit(1)
+        return spreadsheet.sheet1, hist, client
+    except: return None, None, None
 
-def load_portfolio(sheet):
-    data = sheet.get_all_records()
-    if not data: return pd.DataFrame()
-    df = pd.DataFrame(data)
+def load_data():
+    pf_sheet, hist_sheet, sheet_obj = connect_sheet_services()
+    if pf_sheet is None: return pd.DataFrame(), pd.DataFrame(), None
+    
+    pf_data = pf_sheet.get_all_records()
+    df_pf = pd.DataFrame(pf_data)
     cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
     for c in cols:
-        if c in df.columns: df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
-    if 'Son_Islem_Tarihi' not in df.columns: df['Son_Islem_Tarihi'] = "-"
-    if 'Bot_Son_Kontrol' not in df.columns: df['Bot_Son_Kontrol'] = "-"
-    if 'Bot_Trigger' not in df.columns: df['Bot_Trigger'] = "FALSE"
-    if 'Bot_Durum' not in df.columns: df['Bot_Durum'] = "Beklemede"
-    return df
+        if c in df_pf.columns: df_pf[c] = pd.to_numeric(df_pf[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+    
+    try: df_hist = pd.DataFrame(hist_sheet.get_all_records())
+    except: df_hist = pd.DataFrame()
+    return df_pf, df_hist, sheet_obj
 
-def save_portfolio(df, sheet):
-    if sheet:
+# --- 2. AUDIT & RISK ENGINE ---
+class AuditBrain:
+    def get_market_data(self, ticker):
         try:
-            df_exp = df.copy().astype(str)
-            sheet.clear()
-            sheet.update([df_exp.columns.values.tolist()] + df_exp.values.tolist())
-            logger.info("💾 Veriler Sheets'e kaydedildi.")
-        except Exception as e: logger.error(f"Kaydetme Hatası: {e}")
+            df = yf.download(ticker, period="1y", interval="1d", progress=False)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            df.columns = [c.lower() for c in df.columns]
+            return df
+        except: return None
 
-def log_transaction(sheet, ticker, action, amount, price, model):
-    if sheet:
-        now = datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M')
-        try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
-        except: pass
-
-# --- ML & FEATURES (DÜZELTİLDİ) ---
-def get_data(ticker):
-    try:
-        # DÜZELTME: Veri çekme ve sütun temizleme işlemi sağlamlaştırıldı
-        df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
-        if df.empty: return None
+    # --- YENİ EKLENEN KREDİ RİSKİ MODÜLÜ (IFRS 9 / BASEL) ---
+    def calculate_credit_risk_metrics(self, df, exposure_usd):
+        """
+        Merton Modeli benzeri yaklaşımla PD, LGD, ECL hesaplar.
+        Varsayım: Varlık fiyatı %20 düşerse 'Temerrüt' (Default) sayılır.
+        """
+        if df is None or len(df) < 30: return {}
         
-        # MultiIndex kontrolü (yfinance yeni sürümleri için)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        # Sütunları küçük harfe çevir (Close -> close)
-        df.columns = [c.lower() for c in df.columns]
-        return df
-    except: return None
+        current_price = df['close'].iloc[-1]
+        returns = df['close'].pct_change().dropna()
+        
+        # 1. PD (Probability of Default)
+        # Mevcut fiyatın %20 altına düşme olasılığı (1 Aylık ufukta)
+        threshold_price = current_price * 0.80 # %20 Drop barrier
+        volatility_daily = returns.std()
+        volatility_monthly = volatility_daily * np.sqrt(21)
+        
+        # Z-Score hesabı (Distance to Default)
+        ln_returns = np.log(current_price / threshold_price)
+        d2 = ln_returns / volatility_monthly
+        pd_value = 1 - norm.cdf(d2) # Normal dağılımdan olasılık
+        
+        # 2. EAD (Exposure at Default)
+        ead_value = exposure_usd # Şu anki risk tutarı
+        
+        # 3. LGD (Loss Given Default)
+        # Tarihsel olarak en kötü aylık düşüşü LGD olarak kabul edelim (Muhafazakar yaklaşım)
+        rolling_max = df['close'].rolling(30).max()
+        drawdown = (df['close'] / rolling_max) - 1
+        lgd_value = abs(drawdown.min()) # En kötü düşüş oranı (örn. 0.45)
+        if lgd_value < 0.2: lgd_value = 0.45 # Basel standartlarına yakın bir taban değer
+        
+        # 4. ECL (Expected Credit Loss) - Beklenen Zarar Karşılığı
+        ecl_value = pd_value * ead_value * lgd_value
+        
+        return {
+            "PD (%)": pd_value * 100,
+            "EAD ($)": ead_value,
+            "LGD (%)": lgd_value * 100,
+            "ECL ($)": ecl_value,
+            "Risk Skoru": "Yüksek" if pd_value > 0.10 else "Orta" if pd_value > 0.05 else "Düşük"
+        }
 
-def prepare_features(df):
-    df = df.copy().replace([np.inf, -np.inf], np.nan)
-    # Hata kontrolü: Gerekli sütunlar var mı?
-    if 'close' not in df.columns: return None, None
-    
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    df['rsi'] = 100 - (100 / (1 + gain/loss))
-    df['atr'] = (df['high']-df['low']).rolling(14).mean()
-    df['sma_20'] = df['close'].rolling(20).mean()
-    df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
-    df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-    df['range'] = (df['high'] - df['low']) / df['close']
-    df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
-    df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-    df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
-    
-    if len(df) < 50: return None, None # Yetersiz veri
-    
-    return df.iloc[:-1].copy(), df.iloc[[-1]].copy()
-
-class ImputationLab:
-    def apply_imputation(self, df_tr, df_te, method):
-        features = ['log_ret', 'range', 'rsi', 'dist_sma', 'atr', 'volatility_measure']
-        X_tr = df_tr[features].copy(); X_te = df_te[features].copy()
-        X_tr.interpolate(limit_direction='both', inplace=True)
-        X_te.interpolate(limit_direction='both', inplace=True)
-        X_tr.fillna(method='bfill', inplace=True); X_tr.fillna(method='ffill', inplace=True)
-        X_te.fillna(method='bfill', inplace=True); X_te.fillna(method='ffill', inplace=True)
+    def simulate_models(self, df):
+        data = df.copy()
+        data['rsi'] = 100 - (100 / (1 + data['close'].diff().clip(lower=0).rolling(14).mean() / data['close'].diff().clip(upper=0).abs().rolling(14).mean()))
+        data['sma'] = data['close'].rolling(20).mean()
+        data['target'] = (data['close'].shift(-1) > data['close']).astype(int)
+        data = data.dropna()
+        if len(data) < 100: return []
+        
+        X = data[['rsi', 'sma']].values
+        y = data['target'].values
+        split = int(len(X)*0.8)
+        X_tr, X_te = X[:split], X[split:]
+        y_tr, y_te = y[:split], y[split:]
         scaler = RobustScaler()
-        return pd.DataFrame(scaler.fit_transform(X_tr), columns=features, index=X_tr.index), \
-               pd.DataFrame(scaler.transform(X_te), columns=features, index=X_te.index)
+        X_tr = scaler.fit_transform(X_tr); X_te = scaler.transform(X_te)
+        
+        m_xgb = xgb.XGBClassifier(n_estimators=50, max_depth=3, eval_metric='logloss').fit(X_tr, y_tr)
+        p_xgb = m_xgb.predict_proba(X_te[-1].reshape(1,-1))[0][1]
+        
+        m_rf = RandomForestClassifier(n_estimators=50, max_depth=5).fit(X_tr, y_tr)
+        p_rf = m_rf.predict_proba(X_te[-1].reshape(1,-1))[0][1]
+        
+        m_nn = MLPClassifier(hidden_layer_sizes=(32,16), max_iter=500, random_state=42).fit(X_tr, y_tr)
+        p_nn = m_nn.predict_proba(X_te[-1].reshape(1,-1))[0][1]
+        
+        return [
+            {"Model": "XGBoost", "Olasılık": p_xgb, "Karar": "AL" if p_xgb>0.55 else "SAT" if p_xgb<0.45 else "NÖTR"},
+            {"Model": "Random Forest", "Olasılık": p_rf, "Karar": "AL" if p_rf>0.55 else "SAT" if p_rf<0.45 else "NÖTR"},
+            {"Model": "Neural Network", "Olasılık": p_nn, "Karar": "AL" if p_nn>0.55 else "SAT" if p_nn<0.45 else "NÖTR"}
+        ]
 
-class GrandLeagueBrain:
-    def __init__(self): self.lab = ImputationLab()
-    def tune_xgboost(self, X_tr, y_tr):
-        m = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, n_jobs=1, random_state=42)
-        m.fit(X_tr, y_tr)
-        return m
-    def run_league(self, df):
-        imp = 'Linear'
-        split = int(len(df)*0.85)
-        df_tr = df.iloc[:split]; df_val = df.iloc[split:]
-        X_tr, X_val = self.lab.apply_imputation(df_tr, df_val, imp)
-        m_xgb = self.tune_xgboost(X_tr, df_tr['target'])
-        return {'name': f"{imp}+XGB", 'type': 'XGB', 'score': accuracy_score(df_val['target'], m_xgb.predict(X_val)), 'imputer': imp}
+# --- 3. UI LAYOUT ---
+df_pf, df_hist, sheet_obj = load_data()
+brain = AuditBrain()
 
-def analyze_ticker(idx, row):
-    brain = GrandLeagueBrain()
-    # DÜZELTME: Varsayılan değer olarak 'log' eklendi (Hata olursa çökmemesi için)
-    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': row['Ticker'], 'log': 'Veri/Islem Hatasi'}
-    
-    try:
-        df = get_data(row['Ticker'])
-        if df is None or len(df) < 200: 
-            res['log'] = 'Yetersiz/Bozuk Veri'
-            return res
-            
-        hist, future = prepare_features(df)
-        if hist is None:
-            res['log'] = 'Feature Hatasi'
-            return res
-            
-        winner = brain.run_league(hist)
-        last_win = pd.concat([hist.iloc[-30:], future])
-        X_full, X_fut_sc = brain.lab.apply_imputation(hist, future, winner['imputer'])
-        model = brain.tune_xgboost(X_full, hist['target'])
-        prob = model.predict_proba(X_fut_sc)[:,1][0]
+# SIDEBAR
+with st.sidebar:
+    st.title("🛡️ Model Denetim")
+    st.markdown("---")
+    if not df_pf.empty:
+        last_update = str(df_pf['Bot_Son_Kontrol'].iloc[0]).split(' ')[1]
+        status = str(df_pf['Bot_Durum'].iloc[0])
+        st.info(f"Son Güncelleme: {last_update}")
+        if "Hazır" in status: st.success(f"{status}")
+        else: st.warning(f"{status}")
         
-        vol = hist['volatility_measure'].iloc[-1]
-        risk = np.clip(0.04/vol, 0.3, 2.0) if vol > 0 else 1.0
-        
-        decision = "HOLD"
-        if prob > 0.58: decision = "BUY"
-        elif prob < 0.42: decision = "SELL"
-        
-        log = f"{winner['name']} (P:{prob:.2f}|R:{risk:.2f}x)"
-        res.update({'action': decision, 'log': log, 'price': df['close'].iloc[-1]})
-        
-        if row['Durum']=='COIN' and decision=="SELL":
-            res['val'] = float(row['Miktar']) * res['price']
-        elif row['Durum']=='CASH' and decision=="BUY":
-            res['buy'] = {'idx':idx, 'ticker':row['Ticker'], 'p':res['price'], 'w': prob*risk, 'm':log}
-            
-    except Exception as e: 
-        logger.error(f"Err {row['Ticker']}: {e}")
-        res['log'] = f"Hata: {str(e)[:20]}" # Hatayı kısa log olarak ekle
-        
-    return res
+        if st.button("🚨 Acil Durum Taraması"):
+            if sheet_obj:
+                df_pf['Bot_Trigger'] = "TRUE"
+                sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
+                st.toast("Sinyal gönderildi...")
+    st.caption("v19.0 Credit Risk Edition")
 
-if __name__ == "__main__":
-    logger.info("🚀 CLOUD BOT BAŞLATILIYOR (V17.2 Stable)...")
-    pf_sheet, hist_sheet = connect_services()
-    pf = load_portfolio(pf_sheet)
-    if pf.empty: sys.exit(1)
-    
-    # 1. DURUM
-    now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
-    pf['Bot_Durum'] = "☁️ Cloud İşliyor..."
-    pf['Bot_Trigger'] = "FALSE"
-    pf['Bot_Son_Kontrol'] = now_str
-    save_portfolio(pf, pf_sheet)
-    
-    # 2. İŞLEM
-    logger.info("Analiz başlıyor...")
-    updated = pf.copy()
-    cash = updated['Nakit_Bakiye_USD'].sum()
-    updated['Nakit_Bakiye_USD'] = 0.0
-    buys = []
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(analyze_ticker, idx, row): idx for idx, row in updated.iterrows()}
-        for i, future in enumerate(as_completed(futures)):
-            r = future.result()
-            idx = r['idx']
-            # DÜZELTME: r['log'] artık kesinlikle var, KeyError vermez
-            logger.info(f"Analiz: {r['ticker']} -> {r['action']} ({r['log']})")
-            
-            if r['action'] == 'SELL':
-                cash += r['val']
-                updated.at[idx,'Durum']='CASH'; updated.at[idx,'Miktar']=0.0
-                updated.at[idx,'Son_Islem_Log'] = f"SAT {r['log']}"
-                updated.at[idx,'Son_Islem_Tarihi'] = now_str
-                log_transaction(hist_sheet, r['ticker'], "SAT", updated.at[idx,'Miktar'], r['price'], r['log'])
-            elif r['buy']: buys.append(r['buy'])
+# MAIN PAGE
+st.markdown("<div class='audit-header'>🏦 Kurumsal Risk Yönetim Paneli (Basel III / IFRS 9)</div><br>", unsafe_allow_html=True)
 
-    # 3. ALIMLAR
-    if buys and cash > 2.0:
-        total_w = sum([b['w'] for b in buys])
-        for b in buys:
-            amt = ((b['w']/total_w)*cash) / b['p']
-            updated.at[b['idx'],'Durum']='COIN'; updated.at[b['idx'],'Miktar']=amt
-            updated.at[b['idx'],'Nakit_Bakiye_USD']=0.0; updated.at[b['idx'],'Son_Islem_Log']=f"AL {b['m']}"
-            updated.at[b['idx'],'Son_Islem_Tarihi']=now_str
-            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['m'])
-            logger.info(f"✅ ALIM YAPILDI: {b['ticker']}")
-    elif cash > 0: 
-        updated.at[updated.index[0], 'Nakit_Bakiye_USD'] += cash
+if df_pf.empty:
+    st.error("Veri bağlantısı kurulamadı. Lütfen 'Secrets' ayarlarını kontrol edin.")
+else:
+    # KPI ROW
+    total_equity = df_pf['Nakit_Bakiye_USD'].sum() + df_pf[df_pf['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
     
-    # 4. BİTİŞ
-    for idx, row in updated.iterrows():
-        if row['Durum'] == 'COIN':
-            try:
-                p = yf.download(row['Ticker'], period="1d", progress=False)['Close'].iloc[-1]
-                updated.at[idx, 'Kaydedilen_Deger_USD'] = float(row['Miktar']) * float(p)
-            except: pass
-        else: updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
-    
-    updated['Bot_Durum'] = "✅ Cloud Bitti"
-    save_portfolio(updated, pf_sheet)
-    logger.info("🏁 İŞLEM TAMAM.")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Toplam Portföy (EAD)", f"${total_equity:.2f}", delta_color="normal")
+    k2.metric("Aktif Varlıklar", f"{len(df_pf[df_pf['Durum']=='COIN'])}")
+    k3.metric("Model Mimarisi", "Ensemble (XGB+NN)")
+    k4.metric("Risk Metodolojisi", "Merton Model / VaR")
+
+    # TABS
+    tab1, tab2, tab3 = st.tabs(["📊 Basel III Risk Parametreleri", "🧠 Model Denetimi (AI)", "📜 Ham Veriler"])
+
+    with tab1:
+        st.info("💡 Bu bölüm, portföydeki varlıkları 'Kredi Riski' perspektifiyle analiz eder (PD, LGD, ECL).")
+        
+        # Sadece COIN olanları veya Cash olmayanları seçelim, yoksa sembolik seçelim
+        tickers = df_pf['Ticker'].unique()
+        selected_ticker_risk = st.selectbox("Risk Analizi İçin Varlık Seçin:", tickers, key="risk_select")
+        
+        if st.button("Risk Parametrelerini Hesapla (PD/LGD/ECL)"):
+            with st.spinner("Merton Modeli çalıştırılıyor..."):
+                market_data = brain.get_market_data(selected_ticker_risk)
+                
+                # EAD hesapla (O anki miktar * fiyat veya nakit)
+                row = df_pf[df_pf['Ticker']==selected_ticker_risk].iloc[0]
+                exposure = float(row['Kaydedilen_Deger_USD']) if row['Durum']=='COIN' else float(row['Nakit_Bakiye_USD'])
+                if exposure == 0: exposure = 100.0 # Demo amaçlı varsayılan maruziyet
+                
+                risk_metrics = brain.calculate_credit_risk_metrics(market_data, exposure)
+                
+                if risk_metrics:
+                    # RİSK KARTLARI
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.markdown('<div class="risk-card"><h5>PD (Probability of Default)</h5><h3>%{:.2f}</h3><p>İflas Olasılığı (1 Ay)</p></div>'.format(risk_metrics['PD (%)']), unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f'<div class="risk-card"><h5>LGD (Loss Given Default)</h5><h3>%{risk_metrics["LGD (%)"]:.2f}</h3><p>Temerrüt Kayıp Oranı</p></div>', unsafe_allow_html=True)
+                    with c3:
+                        st.markdown(f'<div class="risk-card"><h5>EAD (Exposure)</h5><h3>${risk_metrics["EAD ($)"]:.2f}</h3><p>Maruz Kalınan Tutar</p></div>', unsafe_allow_html=True)
+                    with c4:
+                        st.markdown(f'<div class="risk-card"><h5>ECL (Expected Loss)</h5><h3>${risk_metrics["ECL ($)"]:.4f}</h3><p>Beklenen Kredi Zararı</p></div>', unsafe_allow_html=True)
+                    
+                    st.divider()
+                    
+                    # Risk Gauge Chart
+                    fig = go.Figure(go.Indicator(
+                        mode = "gauge+number",
+                        value = risk_metrics['PD (%)'],
+                        title = {'text': "Risk Skoru (PD)"},
+                        gauge = {
+                            'axis': {'range': [0, 100]},
+                            'bar': {'color': "darkblue"},
+                            'steps': [
+                                {'range': [0, 5], 'color': "green"},
+                                {'range': [5, 20], 'color': "orange"},
+                                {'range': [20, 100], 'color': "red"}],
+                        }))
+                    fig.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.warning(f"📝 **Denetim Notu:** Bu varlık için hesaplanan Beklenen Kredi Zararı (ECL) **${risk_metrics['ECL ($)'].2f}** seviyesindedir. IFRS 9 standardına göre bu tutar kadar karşılık ayrılması önerilir.")
+
+    with tab2:
+        st.subheader("Yapay Zeka Karar Destek Mekanizması")
+        sel_model_ticker = st.selectbox("Model Simülasyonu İçin Varlık:", df_pf['Ticker'].unique(), key="model_select")
+        
+        if st.button("Modelleri Çalıştır (XGBoost vs NeuralNet)"):
+             with st.spinner("Algoritmalar yarışıyor..."):
+                m_data = brain.get_market_data(sel_model_ticker)
+                sim_res = brain.simulate_models(m_data)
+                sim_df = pd.DataFrame(sim_res)
+                
+                # Stilize Tablo
+                def color_decision(val):
+                    color = '#4caf50' if val == 'AL' else '#f44336' if val == 'SAT' else '#ff9800'
+                    return f'color: {color}; font-weight: bold'
+                
+                st.table(sim_df.style.applymap(color_decision, subset=['Karar']))
+                
+                # Fiyat Grafiği
+                fig = px.line(m_data, x=m_data.index, y='close', title=f"{sel_model_ticker} Fiyat Analizi")
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab3:
+        st.dataframe(df_pf, use_container_width=True)
+
+    # Auto-Refresh
+    if "İşleniyor" in str(df_pf['Bot_Durum'].iloc[0]):
+        time.sleep(10)
+        st.rerun()
