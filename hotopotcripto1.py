@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -51,19 +52,16 @@ def load_data():
     pf_sheet, hist_sheet, sheet_obj = connect_sheet_services()
     if pf_sheet is None: return pd.DataFrame(), pd.DataFrame(), None
     
-    # Portföy Verisi
     pf_data = pf_sheet.get_all_records()
     df_pf = pd.DataFrame(pf_data)
-    cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
+    cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", "Volatilite"]
     for c in cols:
         if c in df_pf.columns: df_pf[c] = pd.to_numeric(df_pf[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
     
-    # Geçmiş Verisi (Hata Korumalı)
     try: 
         hist_data = hist_sheet.get_all_values()
         if hist_data:
             expected_cols = ["Tarih", "Ticker", "Action", "Miktar", "Price", "Model"]
-            # Sütun sayısı uyuşmazlığını önlemek için slice alıyoruz
             df_hist = pd.DataFrame(hist_data, columns=expected_cols[:len(hist_data[0])]) 
         else:
             df_hist = pd.DataFrame(columns=["Tarih", "Ticker", "Action", "Miktar", "Price", "Model"])
@@ -76,17 +74,14 @@ def load_data():
 class AuditBrain:
     def get_market_data(self, ticker):
         try:
-            # Multi-level column hatasını önlemek için sağlamlaştırma
             df = yf.download(ticker, period="1y", interval="1d", progress=False)
             if df.empty: return None
-            if isinstance(df.columns, pd.MultiIndex): 
-                df.columns = df.columns.get_level_values(0)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
             return df
         except: return None
 
     def calculate_risk_metrics(self, df):
-        # Eğer veri yoksa veya 30 günden azsa BOŞ sözlük döner
         if df is None or len(df) < 30: return {}
         try:
             ret = df['close'].pct_change().dropna()
@@ -94,8 +89,7 @@ class AuditBrain:
             var_95 = np.percentile(ret, 5)
             drawdown = (df['close'] / df['close'].cummax()) - 1
             return {"Volatilite (Yıllık)": volatility, "VaR (%95)": var_95, "Max Drawdown": drawdown.min()}
-        except:
-            return {}
+        except: return {}
 
     def simulate_models(self, df):
         if df is None or len(df) < 100: return []
@@ -105,7 +99,6 @@ class AuditBrain:
             data['sma'] = data['close'].rolling(20).mean()
             data['target'] = (data['close'].shift(-1) > data['close']).astype(int)
             data = data.dropna()
-            
             if len(data) < 50: return []
             
             X = data[['rsi', 'sma']].values; y = data['target'].values
@@ -117,10 +110,8 @@ class AuditBrain:
             
             m_xgb = xgb.XGBClassifier(n_estimators=50, max_depth=3).fit(X_tr, y_tr)
             p_xgb = m_xgb.predict_proba(X_te[-1].reshape(1,-1))[0][1]
-            
             m_rf = RandomForestClassifier(n_estimators=50, max_depth=5).fit(X_tr, y_tr)
             p_rf = m_rf.predict_proba(X_te[-1].reshape(1,-1))[0][1]
-            
             m_nn = MLPClassifier(hidden_layer_sizes=(32,16), max_iter=500).fit(X_tr, y_tr)
             p_nn = m_nn.predict_proba(X_te[-1].reshape(1,-1))[0][1]
             
@@ -139,13 +130,11 @@ with st.sidebar:
     st.title("🛡️ Model Denetim")
     st.markdown("---")
     if not df_pf.empty:
-        # Hata korumalı veri okuma
         last = df_pf['Bot_Son_Kontrol'].iloc[0] if 'Bot_Son_Kontrol' in df_pf.columns else "---"
         status = df_pf['Bot_Durum'].iloc[0] if 'Bot_Durum' in df_pf.columns else "---"
         st.info(f"Güncelleme: {str(last).split(' ')[-1]}")
         if "Hazır" in str(status): st.success(status)
         else: st.warning(status)
-        
         if st.button("🚨 Acil Durum Taraması", type="primary"):
             if pf_sheet_obj:
                 df_pf['Bot_Trigger'] = "TRUE"
@@ -170,36 +159,35 @@ else:
     k1.metric("NAV (Toplam)", f"${total:.2f}")
     k2.metric("Nakit Oranı", f"%{cash_r:.1f}")
     k3.metric("Model Mimarisi", "Ensemble (XGB+RF+NN)")
-    k4.metric("Veri", "Live Feed", delta_color="off")
+    k4.metric("Veri", "Live & Recorded", delta_color="off")
 
     t1, t2, t3 = st.tabs(["📊 Özet", "🔍 Derin Analiz", "📜 Kayıtlar"])
 
     with t1:
         c1, c2 = st.columns([2, 1])
         with c1:
-            st.subheader("Varlık Dağılımı")
-            cd = df_pf.copy()
-            cd['Val'] = np.where(cd['Durum']=='COIN', cd[val_col], cd['Nakit_Bakiye_USD'])
-            if cd['Val'].sum() > 0:
-                fig = px.pie(cd[cd['Val']>0], values='Val', names='Ticker', hole=0.4)
-                st.plotly_chart(fig, use_container_width=True)
-            else: st.info("Bakiye 0")
+            st.subheader("Portföy Risk Durumu")
+            # --- VOLATİLİTE GÖSTERGESİ ---
+            if 'Volatilite' in df_pf.columns:
+                # Volatiliteyi yüzdelik gösterim için formatla
+                df_show = df_pf[['Ticker', 'Durum', 'Volatilite']].copy()
+                df_show['Volatilite'] = df_show['Volatilite'].apply(lambda x: f"%{x*100:.2f}")
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+            else:
+                st.info("Volatilite verisi bir sonraki analizde yüklenecek...")
+                
         with c2:
             st.subheader("Son İşlemler")
-            if not df_hist.empty and 'Ticker' in df_hist.columns:
+            if not df_hist.empty:
                 st.dataframe(df_hist.tail(10)[['Ticker','Action','Price','Model']], use_container_width=True, hide_index=True)
-            else:
-                st.write("İşlem yok.")
+            else: st.write("İşlem yok.")
 
     with t2:
         tk = st.selectbox("Varlık Seç:", df_pf['Ticker'].unique())
         if st.button("Analiz Et"):
             with st.spinner("Modeller Çalışıyor..."):
                 md = brain.get_market_data(tk)
-                
-                # --- BURASI DÜZELTİLDİ (HATA KORUMASI) ---
                 if md is not None and len(md) > 50:
-                    # Grafik
                     md['SMA'] = md['close'].rolling(20).mean()
                     md['U'] = md['SMA'] + (md['close'].rolling(20).std()*2)
                     md['L'] = md['SMA'] - (md['close'].rolling(20).std()*2)
@@ -210,26 +198,16 @@ else:
                     fig.add_trace(go.Scatter(x=md.index, y=md['L'], name='Alt Bant', line=dict(dash='dot', color='green')))
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Risk Metrikleri
                     risk = brain.calculate_risk_metrics(md)
-                    
-                    # Eğer risk hesaplanabildiyse (Boş değilse)
                     if risk:
                         c1, c2, c3 = st.columns(3)
                         c1.metric("Volatilite", f"%{risk['Volatilite (Yıllık)']*100:.2f}")
                         c2.metric("VaR (%95)", f"%{risk['VaR (%95)']*100:.2f}")
                         c3.metric("Max Drawdown", f"%{risk['Max Drawdown']*100:.2f}")
-                    else:
-                        st.warning("⚠️ Yetersiz veri nedeniyle risk metrikleri hesaplanamadı.")
                     
-                    # Model Simülasyonu
                     sims = brain.simulate_models(md)
-                    if sims:
-                        st.table(pd.DataFrame(sims))
-                    else:
-                        st.warning("⚠️ Yetersiz veri nedeniyle model simülasyonu yapılamadı.")
-                else:
-                    st.error("⚠️ Veri çekilemedi veya veri seti çok kısa.")
+                    if sims: st.table(pd.DataFrame(sims))
+                else: st.error("Veri çekilemedi.")
 
     with t3:
         st.dataframe(df_pf, use_container_width=True)
