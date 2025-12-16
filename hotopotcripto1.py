@@ -13,8 +13,7 @@ import yfinance as yf
 # --- SCIENTIFIC LIBS ---
 from sklearn.preprocessing import RobustScaler
 from sklearn.neural_network import MLPClassifier # Neural Network
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 
 st.set_page_config(page_title="Model Audit Dashboard", layout="wide", page_icon="🏦")
@@ -23,7 +22,6 @@ st.set_page_config(page_title="Model Audit Dashboard", layout="wide", page_icon=
 st.markdown("""
 <style>
     .metric-card {background-color: #1e2130; padding: 15px; border-radius: 10px; border-left: 5px solid #4caf50;}
-    .risk-card {background-color: #1e2130; padding: 15px; border-radius: 10px; border-left: 5px solid #ff9800;}
     .audit-header {font-size: 24px; font-weight: bold; color: #ffffff; border-bottom: 2px solid #555;}
     .stDataFrame {font-size: 12px;}
 </style>
@@ -33,24 +31,32 @@ st.markdown("""
 def connect_sheet_services():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = None
+    # 1. Cloud Secrets Kontrolü
     if "gcp_service_account" in st.secrets:
         try: creds = ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
         except: pass
+    # 2. Yerel Dosya Kontrolü
     if creds is None and os.path.exists("service_account.json"):
         try: creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
         except: pass
+        
     if creds is None: return None, None, None
+    
     try:
         client = gspread.authorize(creds)
         SHEET_ID = "16zjLeps0t1P26OF3o7XQ-djEKKZtZX6t5lFxLmnsvpE"
         spreadsheet = client.open_by_key(SHEET_ID)
         try: hist = spreadsheet.worksheet("Gecmis")
         except: hist = spreadsheet.add_worksheet("Gecmis", 1000, 6)
+        
+        # DÜZELTME: Buradan direk sayfaları döndürüyoruz
         return spreadsheet.sheet1, hist, client
     except: return None, None, None
 
 def load_data():
-    pf_sheet, hist_sheet, sheet_obj = connect_sheet_services()
+    # pf_sheet (Portföy Sayfası) bizim için en önemli nesne
+    pf_sheet, hist_sheet, _ = connect_sheet_services()
+    
     if pf_sheet is None: return pd.DataFrame(), pd.DataFrame(), None
     
     pf_data = pf_sheet.get_all_records()
@@ -61,10 +67,11 @@ def load_data():
     
     try: df_hist = pd.DataFrame(hist_sheet.get_all_records())
     except: df_hist = pd.DataFrame()
-    return df_pf, df_hist, sheet_obj
+    
+    # KRİTİK DÜZELTME: update için 'pf_sheet' nesnesini döndürüyoruz
+    return df_pf, df_hist, pf_sheet
 
 # --- 2. AUDIT ENGINE (LIVE ANALYSIS) ---
-# Bankacılar için anlık model simülasyonu yapan motor
 class AuditBrain:
     def get_market_data(self, ticker):
         try:
@@ -84,7 +91,6 @@ class AuditBrain:
         return {"Volatilite (Yıllık)": volatility, "VaR (%95)": var_95, "Max Drawdown": max_dd}
 
     def simulate_models(self, df):
-        # Basitleştirilmiş Feature Engineering
         data = df.copy()
         data['rsi'] = 100 - (100 / (1 + data['close'].diff().clip(lower=0).rolling(14).mean() / data['close'].diff().clip(upper=0).abs().rolling(14).mean()))
         data['sma'] = data['close'].rolling(20).mean()
@@ -120,7 +126,7 @@ class AuditBrain:
         ]
 
 # --- 3. UI LAYOUT ---
-df_pf, df_hist, sheet_obj = load_data()
+df_pf, df_hist, pf_sheet_obj = load_data() # İsim düzeltildi: pf_sheet_obj
 brain = AuditBrain()
 
 # SIDEBAR
@@ -128,22 +134,32 @@ with st.sidebar:
     st.title("🛡️ Model Denetim")
     st.markdown("---")
     if not df_pf.empty:
-        last_update = str(df_pf['Bot_Son_Kontrol'].iloc[0]).split(' ')[1]
-        status = str(df_pf['Bot_Durum'].iloc[0])
+        # Hata önleyici kontroller
+        last_update = df_pf['Bot_Son_Kontrol'].iloc[0] if 'Bot_Son_Kontrol' in df_pf.columns else "Bilinmiyor"
+        status = df_pf['Bot_Durum'].iloc[0] if 'Bot_Durum' in df_pf.columns else "Bağlanıyor..."
         
-        st.info(f"Son Güncelleme: {last_update}")
-        if "Hazır" in status: st.success(f"Sistem Durumu: {status}")
-        else: st.warning(f"Sistem Durumu: {status}")
+        st.info(f"Son Güncelleme: {str(last_update).split(' ')[-1]}")
+        if "Hazır" in str(status): st.success(f"Sistem: {status}")
+        else: st.warning(f"Sistem: {status}")
         
         st.markdown("### ⚙️ Kontrol Paneli")
         if st.button("🚨 Acil Durum Taraması Başlat", type="primary"):
-            if sheet_obj:
+            if pf_sheet_obj: # Worksheet nesnesini kontrol et
                 df_pf['Bot_Trigger'] = "TRUE"
-                sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
-                st.toast("Tetikleyici gönderildi. Cloud servisi bekleniyor...")
+                try:
+                    # Gspread güncelleme komutu
+                    pf_sheet_obj.clear()
+                    pf_sheet_obj.update([df_pf.columns.values.tolist()] + df_pf.astype(str).values.tolist())
+                    st.toast("Tetikleyici gönderildi. Cloud servisi bekleniyor...")
+                    time.sleep(2)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Güncelleme Hatası: {e}")
+            else:
+                st.error("Sheet bağlantısı yok.")
     
     st.markdown("---")
-    st.caption("v18.0.2 Audit Edition | Powered by XGBoost & Neural Nets")
+    st.caption("v18.1 Audit Edition | Powered by XGBoost & Neural Nets")
 
 # MAIN PAGE
 st.markdown("<div class='audit-header'>🏦 Kurumsal Portföy Yönetim Paneli</div><br>", unsafe_allow_html=True)
@@ -152,8 +168,9 @@ if df_pf.empty:
     st.error("Veri bağlantısı kurulamadı. Lütfen 'Secrets' ayarlarını kontrol edin.")
 else:
     # KPI ROW
-    total_equity = df_pf['Nakit_Bakiye_USD'].sum() + df_pf[df_pf['Durum']=='COIN']['Kaydedilen_Deger_USD'].sum()
-    cash_ratio = (df_pf['Nakit_Bakiye_USD'].sum() / total_equity) * 100
+    val_col = 'Kaydedilen_Deger_USD' if 'Kaydedilen_Deger_USD' in df_pf.columns else 'Baslangic_USD'
+    total_equity = df_pf['Nakit_Bakiye_USD'].sum() + df_pf[df_pf['Durum']=='COIN'][val_col].sum()
+    cash_ratio = (df_pf['Nakit_Bakiye_USD'].sum() / total_equity) * 100 if total_equity > 0 else 0
     
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Toplam Varlık (NAV)", f"${total_equity:.2f}", delta_color="normal")
@@ -169,14 +186,20 @@ else:
         with c1:
             st.subheader("Varlık Dağılımı")
             chart_data = df_pf.copy()
-            chart_data['Değer'] = np.where(chart_data['Durum']=='COIN', chart_data['Kaydedilen_Deger_USD'], chart_data['Nakit_Bakiye_USD'])
-            fig = px.pie(chart_data[chart_data['Değer']>0], values='Değer', names='Ticker', hole=0.4, color_discrete_sequence=px.colors.sequential.RdBu)
-            st.plotly_chart(fig, use_container_width=True)
+            chart_data['Değer'] = np.where(chart_data['Durum']=='COIN', chart_data[val_col], chart_data['Nakit_Bakiye_USD'])
+            
+            if chart_data['Değer'].sum() > 0:
+                fig = px.pie(chart_data[chart_data['Değer']>0], values='Değer', names='Ticker', hole=0.4, color_discrete_sequence=px.colors.sequential.RdBu)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Portföy tamamen nakitte veya boş.")
         
         with c2:
             st.subheader("Son Aksiyonlar")
             if not df_hist.empty:
-                st.dataframe(df_hist.tail(5)[['Ticker','Action','Price','Model']], use_container_width=True, hide_index=True)
+                st.dataframe(df_hist.tail(10)[['Ticker','Action','Price','Model']], use_container_width=True, hide_index=True)
+            else:
+                st.write("Henüz işlem geçmişi yok.")
 
     with tab2:
         st.info("Bu modül, seçilen varlık için anlık olarak yapay zeka modellerini çalıştırır ve risk analizi yapar.")
@@ -227,7 +250,6 @@ else:
     with tab3:
         st.subheader("Veritabanı Kayıtları (Google Sheets)")
         st.dataframe(df_pf, use_container_width=True)
-        st.download_button("Excel Olarak İndir", df_pf.to_csv(), "portfolio_audit.csv")
 
     # Auto-Refresh Mechanism
     if "İşleniyor" in str(df_pf['Bot_Durum'].iloc[0]):
