@@ -53,9 +53,13 @@ def load_portfolio(sheet):
     data = sheet.get_all_records()
     if not data: return pd.DataFrame()
     df = pd.DataFrame(data)
-    cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD"]
+    cols = ["Miktar", "Son_Islem_Fiyati", "Nakit_Bakiye_USD", "Baslangic_USD", "Kaydedilen_Deger_USD", "Volatilite"]
     for c in cols:
         if c in df.columns: df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
+    
+    # Yeni Sütun Kontrolü: Volatilite
+    if 'Volatilite' not in df.columns: df['Volatilite'] = 0.0
+    
     if 'Son_Islem_Tarihi' not in df.columns: df['Son_Islem_Tarihi'] = "-"
     if 'Bot_Son_Kontrol' not in df.columns: df['Bot_Son_Kontrol'] = "-"
     if 'Bot_Trigger' not in df.columns: df['Bot_Trigger'] = "FALSE"
@@ -77,25 +81,18 @@ def log_transaction(sheet, ticker, action, amount, price, model):
         try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
         except: pass
 
-# --- ML & FEATURES (DÜZELTİLDİ) ---
+# --- ML & FEATURES ---
 def get_data(ticker):
     try:
-        # DÜZELTME: Veri çekme ve sütun temizleme işlemi sağlamlaştırıldı
         df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
         if df.empty: return None
-        
-        # MultiIndex kontrolü (yfinance yeni sürümleri için)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        # Sütunları küçük harfe çevir (Close -> close)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [c.lower() for c in df.columns]
         return df
     except: return None
 
 def prepare_features(df):
     df = df.copy().replace([np.inf, -np.inf], np.nan)
-    # Hata kontrolü: Gerekli sütunlar var mı?
     if 'close' not in df.columns: return None, None
     
     delta = df['close'].diff()
@@ -106,12 +103,14 @@ def prepare_features(df):
     df['dist_sma'] = (df['close'] - df['sma_20']) / df['sma_20']
     df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
     df['range'] = (df['high'] - df['low']) / df['close']
+    
+    # Volatilite Hesabı
     df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
+    
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
     
-    if len(df) < 50: return None, None # Yetersiz veri
-    
+    if len(df) < 50: return None, None
     return df.iloc[:-1].copy(), df.iloc[[-1]].copy()
 
 class ImputationLab:
@@ -142,13 +141,11 @@ class GrandLeagueBrain:
 
 def analyze_ticker(idx, row):
     brain = GrandLeagueBrain()
-    # DÜZELTME: Varsayılan değer olarak 'log' eklendi (Hata olursa çökmemesi için)
-    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': row['Ticker'], 'log': 'Veri/Islem Hatasi'}
-    
+    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': row['Ticker'], 'log': 'Veri Hatasi', 'volatility_annual': 0.0}
     try:
         df = get_data(row['Ticker'])
         if df is None or len(df) < 200: 
-            res['log'] = 'Yetersiz/Bozuk Veri'
+            res['log'] = 'Yetersiz Veri'
             return res
             
         hist, future = prepare_features(df)
@@ -156,6 +153,12 @@ def analyze_ticker(idx, row):
             res['log'] = 'Feature Hatasi'
             return res
             
+        # --- YENİ EKLENEN KISIM: Volatiliteyi Yakala ---
+        # 14 günlük standart sapmayı Yıllık Volatiliteye çevir (x sqrt(252))
+        current_vol = hist['volatility_measure'].iloc[-1]
+        annual_vol = current_vol * np.sqrt(252)
+        res['volatility_annual'] = annual_vol # Sonuçlara ekle
+        
         winner = brain.run_league(hist)
         last_win = pd.concat([hist.iloc[-30:], future])
         X_full, X_fut_sc = brain.lab.apply_imputation(hist, future, winner['imputer'])
@@ -179,19 +182,19 @@ def analyze_ticker(idx, row):
             
     except Exception as e: 
         logger.error(f"Err {row['Ticker']}: {e}")
-        res['log'] = f"Hata: {str(e)[:20]}" # Hatayı kısa log olarak ekle
+        res['log'] = f"Hata: {str(e)[:20]}"
         
     return res
 
 if __name__ == "__main__":
-    logger.info("🚀 CLOUD BOT BAŞLATILIYOR (V17.2 Stable)...")
+    logger.info("🚀 CLOUD BOT BAŞLATILIYOR (V17.3 Volatility)...")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     if pf.empty: sys.exit(1)
     
     # 1. DURUM
     now_str = str(datetime.now(pytz.timezone('Turkey')).strftime('%Y-%m-%d %H:%M'))
-    pf['Bot_Durum'] = "☁️ Cloud İşliyor..."
+    pf['Bot_Durum'] = "☁️ Risk Analizi Yapılıyor..."
     pf['Bot_Trigger'] = "FALSE"
     pf['Bot_Son_Kontrol'] = now_str
     save_portfolio(pf, pf_sheet)
@@ -208,8 +211,11 @@ if __name__ == "__main__":
         for i, future in enumerate(as_completed(futures)):
             r = future.result()
             idx = r['idx']
-            # DÜZELTME: r['log'] artık kesinlikle var, KeyError vermez
-            logger.info(f"Analiz: {r['ticker']} -> {r['action']} ({r['log']})")
+            
+            # --- VOLATİLİTEYİ KAYDET ---
+            updated.at[idx, 'Volatilite'] = float(r['volatility_annual'])
+            
+            logger.info(f"Analiz: {r['ticker']} -> {r['action']} (Vol: %{r['volatility_annual']*100:.1f})")
             
             if r['action'] == 'SELL':
                 cash += r['val']
@@ -241,6 +247,6 @@ if __name__ == "__main__":
             except: pass
         else: updated.at[idx, 'Kaydedilen_Deger_USD'] = row['Nakit_Bakiye_USD']
     
-    updated['Bot_Durum'] = "✅ Cloud Bitti"
+    updated['Bot_Durum'] = "✅ Cloud Hazır"
     save_portfolio(updated, pf_sheet)
     logger.info("🏁 İŞLEM TAMAM.")
