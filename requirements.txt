@@ -1,4 +1,5 @@
 streamlit
+matplotlib
 yfinance
 pandas
 numpy
@@ -17,3 +18,4 @@ optuna
 plotly
 numba
 pytz
+
