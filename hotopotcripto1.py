@@ -58,14 +58,12 @@ def load_data():
     for c in cols:
         if c in df_pf.columns: df_pf[c] = pd.to_numeric(df_pf[c].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0)
     
-    # --- DÜZELTME BURADA (KeyError Fix) ---
+    # Geçmiş Verisi (Hata Korumalı)
     try: 
-        # get_all_records() yerine get_all_values() kullanıyoruz (Ham veri)
         hist_data = hist_sheet.get_all_values()
         if hist_data:
-            # Sütun isimlerini manuel atıyoruz, böylece "Ticker" sütunu garanti oluyor
-            # Botun yazdığı sıra: [Tarih, Ticker, Action, Miktar, Fiyat, Model]
             expected_cols = ["Tarih", "Ticker", "Action", "Miktar", "Price", "Model"]
+            # Sütun sayısı uyuşmazlığını önlemek için slice alıyoruz
             df_hist = pd.DataFrame(hist_data, columns=expected_cols[:len(hist_data[0])]) 
         else:
             df_hist = pd.DataFrame(columns=["Tarih", "Ticker", "Action", "Miktar", "Price", "Model"])
@@ -78,49 +76,60 @@ def load_data():
 class AuditBrain:
     def get_market_data(self, ticker):
         try:
+            # Multi-level column hatasını önlemek için sağlamlaştırma
             df = yf.download(ticker, period="1y", interval="1d", progress=False)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            if df.empty: return None
+            if isinstance(df.columns, pd.MultiIndex): 
+                df.columns = df.columns.get_level_values(0)
             df.columns = [c.lower() for c in df.columns]
             return df
         except: return None
 
     def calculate_risk_metrics(self, df):
+        # Eğer veri yoksa veya 30 günden azsa BOŞ sözlük döner
         if df is None or len(df) < 30: return {}
-        ret = df['close'].pct_change().dropna()
-        volatility = ret.std() * np.sqrt(252)
-        var_95 = np.percentile(ret, 5)
-        drawdown = (df['close'] / df['close'].cummax()) - 1
-        return {"Volatilite (Yıllık)": volatility, "VaR (%95)": var_95, "Max Drawdown": drawdown.min()}
+        try:
+            ret = df['close'].pct_change().dropna()
+            volatility = ret.std() * np.sqrt(252)
+            var_95 = np.percentile(ret, 5)
+            drawdown = (df['close'] / df['close'].cummax()) - 1
+            return {"Volatilite (Yıllık)": volatility, "VaR (%95)": var_95, "Max Drawdown": drawdown.min()}
+        except:
+            return {}
 
     def simulate_models(self, df):
-        data = df.copy()
-        data['rsi'] = 100 - (100 / (1 + data['close'].diff().clip(lower=0).rolling(14).mean() / data['close'].diff().clip(upper=0).abs().rolling(14).mean()))
-        data['sma'] = data['close'].rolling(20).mean()
-        data['target'] = (data['close'].shift(-1) > data['close']).astype(int)
-        data = data.dropna()
-        if len(data) < 100: return []
-        
-        X = data[['rsi', 'sma']].values; y = data['target'].values
-        split = int(len(X)*0.8)
-        X_tr, X_te = X[:split], X[split:]
-        y_tr, y_te = y[:split], y[split:]
-        scaler = RobustScaler()
-        X_tr = scaler.fit_transform(X_tr); X_te = scaler.transform(X_te)
-        
-        m_xgb = xgb.XGBClassifier(n_estimators=50, max_depth=3).fit(X_tr, y_tr)
-        p_xgb = m_xgb.predict_proba(X_te[-1].reshape(1,-1))[0][1]
-        
-        m_rf = RandomForestClassifier(n_estimators=50, max_depth=5).fit(X_tr, y_tr)
-        p_rf = m_rf.predict_proba(X_te[-1].reshape(1,-1))[0][1]
-        
-        m_nn = MLPClassifier(hidden_layer_sizes=(32,16), max_iter=500).fit(X_tr, y_tr)
-        p_nn = m_nn.predict_proba(X_te[-1].reshape(1,-1))[0][1]
-        
-        return [
-            {"Model": "XGBoost", "Olasılık": p_xgb, "Karar": "AL" if p_xgb>0.55 else "SAT" if p_xgb<0.45 else "NÖTR"},
-            {"Model": "Random Forest", "Olasılık": p_rf, "Karar": "AL" if p_rf>0.55 else "SAT" if p_rf<0.45 else "NÖTR"},
-            {"Model": "Neural Network", "Olasılık": p_nn, "Karar": "AL" if p_nn>0.55 else "SAT" if p_nn<0.45 else "NÖTR"}
-        ]
+        if df is None or len(df) < 100: return []
+        try:
+            data = df.copy()
+            data['rsi'] = 100 - (100 / (1 + data['close'].diff().clip(lower=0).rolling(14).mean() / data['close'].diff().clip(upper=0).abs().rolling(14).mean()))
+            data['sma'] = data['close'].rolling(20).mean()
+            data['target'] = (data['close'].shift(-1) > data['close']).astype(int)
+            data = data.dropna()
+            
+            if len(data) < 50: return []
+            
+            X = data[['rsi', 'sma']].values; y = data['target'].values
+            split = int(len(X)*0.8)
+            X_tr, X_te = X[:split], X[split:]
+            y_tr, y_te = y[:split], y[split:]
+            scaler = RobustScaler()
+            X_tr = scaler.fit_transform(X_tr); X_te = scaler.transform(X_te)
+            
+            m_xgb = xgb.XGBClassifier(n_estimators=50, max_depth=3).fit(X_tr, y_tr)
+            p_xgb = m_xgb.predict_proba(X_te[-1].reshape(1,-1))[0][1]
+            
+            m_rf = RandomForestClassifier(n_estimators=50, max_depth=5).fit(X_tr, y_tr)
+            p_rf = m_rf.predict_proba(X_te[-1].reshape(1,-1))[0][1]
+            
+            m_nn = MLPClassifier(hidden_layer_sizes=(32,16), max_iter=500).fit(X_tr, y_tr)
+            p_nn = m_nn.predict_proba(X_te[-1].reshape(1,-1))[0][1]
+            
+            return [
+                {"Model": "XGBoost", "Olasılık": p_xgb, "Karar": "AL" if p_xgb>0.55 else "SAT" if p_xgb<0.45 else "NÖTR"},
+                {"Model": "Random Forest", "Olasılık": p_rf, "Karar": "AL" if p_rf>0.55 else "SAT" if p_rf<0.45 else "NÖTR"},
+                {"Model": "Neural Network", "Olasılık": p_nn, "Karar": "AL" if p_nn>0.55 else "SAT" if p_nn<0.45 else "NÖTR"}
+            ]
+        except: return []
 
 # --- 3. UI LAYOUT ---
 df_pf, df_hist, pf_sheet_obj = load_data()
@@ -130,6 +139,7 @@ with st.sidebar:
     st.title("🛡️ Model Denetim")
     st.markdown("---")
     if not df_pf.empty:
+        # Hata korumalı veri okuma
         last = df_pf['Bot_Son_Kontrol'].iloc[0] if 'Bot_Son_Kontrol' in df_pf.columns else "---"
         status = df_pf['Bot_Durum'].iloc[0] if 'Bot_Durum' in df_pf.columns else "---"
         st.info(f"Güncelleme: {str(last).split(' ')[-1]}")
@@ -176,7 +186,6 @@ else:
             else: st.info("Bakiye 0")
         with c2:
             st.subheader("Son İşlemler")
-            # ARTIK GÜVENLİ: Sütun isimleri load_data içinde zorla atandı
             if not df_hist.empty and 'Ticker' in df_hist.columns:
                 st.dataframe(df_hist.tail(10)[['Ticker','Action','Price','Model']], use_container_width=True, hide_index=True)
             else:
@@ -187,7 +196,10 @@ else:
         if st.button("Analiz Et"):
             with st.spinner("Modeller Çalışıyor..."):
                 md = brain.get_market_data(tk)
-                if md is not None:
+                
+                # --- BURASI DÜZELTİLDİ (HATA KORUMASI) ---
+                if md is not None and len(md) > 50:
+                    # Grafik
                     md['SMA'] = md['close'].rolling(20).mean()
                     md['U'] = md['SMA'] + (md['close'].rolling(20).std()*2)
                     md['L'] = md['SMA'] - (md['close'].rolling(20).std()*2)
@@ -198,13 +210,26 @@ else:
                     fig.add_trace(go.Scatter(x=md.index, y=md['L'], name='Alt Bant', line=dict(dash='dot', color='green')))
                     st.plotly_chart(fig, use_container_width=True)
                     
+                    # Risk Metrikleri
                     risk = brain.calculate_risk_metrics(md)
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Volatilite", f"%{risk['Volatilite (Yıllık)']*100:.2f}")
-                    c2.metric("VaR (%95)", f"%{risk['VaR (%95)']*100:.2f}")
-                    c3.metric("Max Drawdown", f"%{risk['Max Drawdown']*100:.2f}")
                     
-                    st.table(pd.DataFrame(brain.simulate_models(md)))
+                    # Eğer risk hesaplanabildiyse (Boş değilse)
+                    if risk:
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Volatilite", f"%{risk['Volatilite (Yıllık)']*100:.2f}")
+                        c2.metric("VaR (%95)", f"%{risk['VaR (%95)']*100:.2f}")
+                        c3.metric("Max Drawdown", f"%{risk['Max Drawdown']*100:.2f}")
+                    else:
+                        st.warning("⚠️ Yetersiz veri nedeniyle risk metrikleri hesaplanamadı.")
+                    
+                    # Model Simülasyonu
+                    sims = brain.simulate_models(md)
+                    if sims:
+                        st.table(pd.DataFrame(sims))
+                    else:
+                        st.warning("⚠️ Yetersiz veri nedeniyle model simülasyonu yapılamadı.")
+                else:
+                    st.error("⚠️ Veri çekilemedi veya veri seti çok kısa.")
 
     with t3:
         st.dataframe(df_pf, use_container_width=True)
