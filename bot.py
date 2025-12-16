@@ -77,13 +77,27 @@ def log_transaction(sheet, ticker, action, amount, price, model):
         try: sheet.append_row([now, ticker, action, float(amount), float(price), model])
         except: pass
 
-# --- ML & FEATURES ---
+# --- ML & FEATURES (DÜZELTİLDİ) ---
 def get_data(ticker):
-    try: return yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
+    try:
+        # DÜZELTME: Veri çekme ve sütun temizleme işlemi sağlamlaştırıldı
+        df = yf.download(ticker, period=DATA_PERIOD, interval="1d", progress=False)
+        if df.empty: return None
+        
+        # MultiIndex kontrolü (yfinance yeni sürümleri için)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # Sütunları küçük harfe çevir (Close -> close)
+        df.columns = [c.lower() for c in df.columns]
+        return df
     except: return None
 
 def prepare_features(df):
     df = df.copy().replace([np.inf, -np.inf], np.nan)
+    # Hata kontrolü: Gerekli sütunlar var mı?
+    if 'close' not in df.columns: return None, None
+    
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df['rsi'] = 100 - (100 / (1 + gain/loss))
@@ -95,6 +109,9 @@ def prepare_features(df):
     df['volatility_measure'] = df['close'].pct_change().rolling(window=14).std()
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     df = df.dropna(subset=['atr', 'rsi', 'volatility_measure'])
+    
+    if len(df) < 50: return None, None # Yetersiz veri
+    
     return df.iloc[:-1].copy(), df.iloc[[-1]].copy()
 
 class ImputationLab:
@@ -125,32 +142,49 @@ class GrandLeagueBrain:
 
 def analyze_ticker(idx, row):
     brain = GrandLeagueBrain()
-    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': row['Ticker']}
+    # DÜZELTME: Varsayılan değer olarak 'log' eklendi (Hata olursa çökmemesi için)
+    res = {'idx': idx, 'action': None, 'val': 0, 'buy': None, 'ticker': row['Ticker'], 'log': 'Veri/Islem Hatasi'}
+    
     try:
         df = get_data(row['Ticker'])
-        if df is None or len(df) < 200: return res
+        if df is None or len(df) < 200: 
+            res['log'] = 'Yetersiz/Bozuk Veri'
+            return res
+            
         hist, future = prepare_features(df)
+        if hist is None:
+            res['log'] = 'Feature Hatasi'
+            return res
+            
         winner = brain.run_league(hist)
         last_win = pd.concat([hist.iloc[-30:], future])
         X_full, X_fut_sc = brain.lab.apply_imputation(hist, future, winner['imputer'])
         model = brain.tune_xgboost(X_full, hist['target'])
         prob = model.predict_proba(X_fut_sc)[:,1][0]
+        
         vol = hist['volatility_measure'].iloc[-1]
         risk = np.clip(0.04/vol, 0.3, 2.0) if vol > 0 else 1.0
+        
         decision = "HOLD"
         if prob > 0.58: decision = "BUY"
         elif prob < 0.42: decision = "SELL"
+        
         log = f"{winner['name']} (P:{prob:.2f}|R:{risk:.2f}x)"
         res.update({'action': decision, 'log': log, 'price': df['close'].iloc[-1]})
+        
         if row['Durum']=='COIN' and decision=="SELL":
             res['val'] = float(row['Miktar']) * res['price']
         elif row['Durum']=='CASH' and decision=="BUY":
             res['buy'] = {'idx':idx, 'ticker':row['Ticker'], 'p':res['price'], 'w': prob*risk, 'm':log}
-    except Exception as e: logger.error(f"Err {row['Ticker']}: {e}")
+            
+    except Exception as e: 
+        logger.error(f"Err {row['Ticker']}: {e}")
+        res['log'] = f"Hata: {str(e)[:20]}" # Hatayı kısa log olarak ekle
+        
     return res
 
 if __name__ == "__main__":
-    logger.info("🚀 CLOUD BOT BAŞLATILIYOR (V17.1 Fix)...")
+    logger.info("🚀 CLOUD BOT BAŞLATILIYOR (V17.2 Stable)...")
     pf_sheet, hist_sheet = connect_services()
     pf = load_portfolio(pf_sheet)
     if pf.empty: sys.exit(1)
@@ -174,7 +208,9 @@ if __name__ == "__main__":
         for i, future in enumerate(as_completed(futures)):
             r = future.result()
             idx = r['idx']
+            # DÜZELTME: r['log'] artık kesinlikle var, KeyError vermez
             logger.info(f"Analiz: {r['ticker']} -> {r['action']} ({r['log']})")
+            
             if r['action'] == 'SELL':
                 cash += r['val']
                 updated.at[idx,'Durum']='CASH'; updated.at[idx,'Miktar']=0.0
@@ -183,7 +219,7 @@ if __name__ == "__main__":
                 log_transaction(hist_sheet, r['ticker'], "SAT", updated.at[idx,'Miktar'], r['price'], r['log'])
             elif r['buy']: buys.append(r['buy'])
 
-    # 3. ALIMLAR (HATA BURADAYDI, DÜZELTİLDİ)
+    # 3. ALIMLAR
     if buys and cash > 2.0:
         total_w = sum([b['w'] for b in buys])
         for b in buys:
@@ -191,8 +227,7 @@ if __name__ == "__main__":
             updated.at[b['idx'],'Durum']='COIN'; updated.at[b['idx'],'Miktar']=amt
             updated.at[b['idx'],'Nakit_Bakiye_USD']=0.0; updated.at[b['idx'],'Son_Islem_Log']=f"AL {b['m']}"
             updated.at[b['idx'],'Son_Islem_Tarihi']=now_str
-            # --- DÜZELTİLEN SATIR AŞAĞIDA ---
-            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['m']) 
+            log_transaction(hist_sheet, b['ticker'], "AL", amt, b['p'], b['m'])
             logger.info(f"✅ ALIM YAPILDI: {b['ticker']}")
     elif cash > 0: 
         updated.at[updated.index[0], 'Nakit_Bakiye_USD'] += cash
